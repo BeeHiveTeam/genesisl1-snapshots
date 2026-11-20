@@ -17,6 +17,15 @@ import producer as p
 from capture import freeze
 
 
+# Cosmos SDK Snapshot: fields 1/2/3, field 4 (32-byte SHA-256), then
+# field 5 (68 bytes containing two field-1 digests). Independent wire fixture.
+SDK_FIXTURE = bytes.fromhex(
+    "08 64 10 03 18 02 22 20 c3aad96876da265d86a3d0923b7958cefd58692eff127db3dc110c2f2c62ed9c"
+    " 2a 44 0a 20 b7d99a3ac66861054bc52ced4851c4a64126afaaf5f0cca84d345ae5aa81966f"
+    " 0a 20 923b805711041e23a99f07e146591c500261d1c289f62a9d39f8581ceb8a10ca"
+)
+
+
 class ProducerTest(unittest.TestCase):
     def setUp(self):
         folder = tempfile.TemporaryDirectory()
@@ -40,11 +49,18 @@ class ProducerTest(unittest.TestCase):
         files.mkdir(parents=True)
         for i,d in enumerate(chunks):
             (files/str(i)).write_bytes(d)
-        (dest/"snapshot.pb").write_bytes(archive.sdk_metadata(snap)[0])
+        (dest/"snapshot.pb").write_bytes(SDK_FIXTURE)
         self.proof = {"snapshot_app_hash":"A"*64, "snapshot_block_time_utc":p.now().isoformat(),
                       "fixed_trust_anchor":{"height":99, "hash":"B"*64, "trust_period":"144h",
                                             "expires_at_utc":(p.now()+timedelta(hours=143)).isoformat()}}
         p.put(c.ready, {"snapshot":snap, "proof":self.proof})
+
+    def test_sdk_wire_format_and_varint_boundaries(self):
+        self.assertEqual(archive.sdk_metadata(self.snap)[0], SDK_FIXTURE)
+        for number, encoded in [(0, "00"), (127, "7f"), (128, "8001"),
+                                (16383, "ff7f"), (16384, "808001")]:
+            with self.subTest(number=number):
+                self.assertEqual(archive.varint(number), bytes.fromhex(encoded))
 
     def test_publish_and_fail_closed(self):
         c = self.c

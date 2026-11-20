@@ -16,7 +16,7 @@ cp -R -- "$upstream" "$scratch/module/iavl-parallel"
 chmod -R u+w "$scratch/module/iavl-parallel"
 patch -s --fuzz=0 -d "$scratch/module/iavl-parallel" -p1 < "$here/exporter/iavl-v1.2.6.patch"
 cd "$scratch/module"
-go test -mod=readonly -p 2 -count=1 .
+go test -vet=all -mod=readonly -p 2 -count=1 .
 go build -mod=readonly -p 2 -trimpath -o "$scratch/native-export" .
 mkdir -p -- "$(dirname -- "$target")"
 install -m 0755 -- "$scratch/native-export" "$target"

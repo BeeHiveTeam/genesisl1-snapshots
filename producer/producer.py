@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import resource
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -121,7 +122,7 @@ class Config:
 
 def filename(height):
     require(type(height) is int and 0 < height < 2**53, "Invalid publication height")
-    return f"genesis_29-2-native-{height}-format3.tar.gz"
+    return f"{CHAIN}-native-{height}-format3.tar.gz"
 
 
 def check_build_space(c, latest):
@@ -335,24 +336,71 @@ def build(c):
         log("ready_to_publish", height=h, chunks=snapshot["chunks"])
 
 
+def intact_edition(public, manifest, owner):
+    name = manifest["file"]
+    checksum = (manifest["sha256"] + "  " + name + "\n").encode()
+    try:
+        for path, size in ((public / name, manifest["bytes"]), (public / (name + ".sha256"), len(checksum))):
+            info = path.lstat()
+            if info.st_uid != owner or not stat.S_ISREG(info.st_mode) or info.st_size != size:
+                return False
+        return (public / (name + ".sha256")).read_bytes() == checksum
+    except FileNotFoundError:
+        return False
+
+
 def retire(public, height):
     # Only a previous versioned manifest written by this automated publisher
     # authorizes removing its own archive. Always keep the newest two editions.
     candidates = []
-    for path in public.glob("genesis_29-2-native-*-format3.json"):
-        if re.fullmatch(r"genesis_29-2-native-[0-9]+-format3\.json", path.name) and path.stat().st_uid == os.getuid():
-            m = read(path)
-            h = m["snapshot_height"]
-            if m.get("publisher_schema") == "beehive-native-v1" and m["file"] == filename(h) and h <= height:
-                candidates.append((h, path, m))
-    for _, path, m in sorted(candidates, reverse=True)[2:]:
-        deadline = max(parse_time(m["published_at_utc"])+timedelta(days=7),
-                       parse_time(m["fixed_trust_anchor"]["expires_at_utc"])+timedelta(days=1))
-        if deadline <= now():
-            name = m["file"]
-            (public/name).unlink(missing_ok=True)
-            (public/(name+".sha256")).unlink(missing_ok=True)
-            path.unlink()
+    owner = os.getuid()
+    for path in public.glob(f"{CHAIN}-native-*-format3.json"):
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != owner:
+            continue
+        try:
+            manifest = read(path)
+            if not isinstance(manifest, dict) or manifest.get("publisher_schema") != "beehive-native-v1":
+                continue
+            h = manifest["snapshot_height"]
+            name = filename(h)
+            if (h > height or manifest.get("chain_id") != CHAIN or manifest.get("snapshot_format") != 3
+                    or manifest.get("file") != name
+                    or path.name != name.removesuffix(".tar.gz") + ".json"):
+                continue
+            if (type(manifest.get("bytes")) is not int or manifest["bytes"] <= 0
+                    or not re.fullmatch("[0-9a-f]{64}", manifest.get("sha256", ""))):
+                continue
+            expires = parse_time(manifest["fixed_trust_anchor"]["expires_at_utc"])
+            published = parse_time(manifest["published_at_utc"])
+            deadline = max(published + timedelta(days=7), expires + timedelta(days=1))
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+            continue
+        candidates.append((h, path, manifest, deadline))
+
+    candidates.sort(key=lambda row: row[0], reverse=True)
+    if len(candidates) <= 2:
+        return
+    if candidates[0][0] != height or not all(intact_edition(public, row[2], owner) for row in candidates[:2]):
+        log("retention_deferred", height=height, reason="newest two archives or checksums incomplete")
+        return
+    for _, path, manifest, deadline in candidates[2:]:
+        name = manifest["file"]
+        if now() < deadline:
+            continue
+        files = [public / name, public / (name + ".sha256"), path]
+        # A partial earlier cleanup may have left just the manifest. A foreign
+        # file or a link at any of these names keeps the whole edition intact.
+        for item in files:
+            try:
+                info = item.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != owner:
+                break
+        else:
+            for item in files:
+                item.unlink(missing_ok=True)
 
 
 def publish(c):

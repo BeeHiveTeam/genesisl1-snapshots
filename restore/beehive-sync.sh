@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Generated from client.sh.in and helper.py by build_client.py.
 set -Eeuo pipefail
 umask 077
 sync_user_agent='BeeHive-GenesisL1-Sync/1'
@@ -17,6 +18,7 @@ BEEHIVE
 # TOML parsing and streaming tar validation use the Python standard library.
 support() {
     BEEHIVE_SYNC_AGENT="$sync_user_agent" python3 - "$@" <<'PYTHON'
+"""GenesisL1 restore catalog, checks and filesystem operations."""
 import concurrent.futures
 import datetime as dt
 import hashlib
@@ -45,7 +47,7 @@ LC_BYTES = 701371435944
 LC_SHA = "24aaaf3bfdce38eef451503386457bbe15c5892a9227644510858d034e2aff8b"
 LC_MIRROR = "https://ftp.basementnodes.ca/snapshots/gl1/data.tar.lz4"
 GIB = 1024**3
-HTTP_HEADERS = {"User-Agent": os.environ["BEEHIVE_SYNC_AGENT"]}
+HTTP_HEADERS = {"User-Agent": os.environ.get("BEEHIVE_SYNC_AGENT", "BeeHive-GenesisL1-Sync/1")}
 
 
 def require(ok, message):
@@ -459,6 +461,22 @@ def check_memiavl(home, height, expected):
     print("Restored AppHash verified across",len(stores),"SDK stores at height",height)
 
 
+def verify_head(local, height):
+    signed = rpc(local, "commit?height="+str(height))["signed_header"]
+    header, commit = signed["header"], signed["commit"]
+    require(header["chain_id"] == CHAIN and int(header["height"]) == height == int(commit["height"]),
+            "wrong local block")
+    block, app, _ = commits(height)
+    require(digest(commit["block_id"]["hash"]) == block and digest(header["app_hash"]) == app,
+            "local block or application hash differs from independent witnesses")
+    for server in RPCS:
+        remote = rpc(server, "status")
+        require(remote["node_info"]["network"] == CHAIN, "wrong witness chain")
+        if abs(int(remote["sync_info"]["latest_block_height"])-height) > 5:
+            sys.exit(75)
+    print("Verified mainnet block and application hash at", height)
+
+
 def main():
     action, *args = sys.argv[1:]
     if action=="catalog": print(json.dumps(catalogue(*args)))
@@ -479,30 +497,20 @@ def main():
     elif action=="config": configure(Path(args[0]),json.loads(Path(args[1]).read_text()),int(args[2]))
     elif action=="extract": extract(Path(args[0]),Path(args[1]),int(args[2]))
     elif action=="memiavl": check_memiavl(Path(args[0]),int(args[1]),args[2])
-    elif action=="head-verify":
-        local,height=args[0],int(args[1])
-        signed=rpc(local,"commit?height="+str(height))["signed_header"]
-        require(signed["header"]["chain_id"]==CHAIN and int(signed["header"]["height"])==height, "wrong local block")
-        block,app,_=commits(height)
-        require(digest(signed["commit"]["block_id"]["hash"])==block and digest(signed["header"]["app_hash"])==app,
-                "local block or application hash differs from independent witnesses")
-        for server in RPCS:
-            remote=rpc(server,"status")
-            require(remote["node_info"]["network"]==CHAIN,"wrong witness chain")
-            if abs(int(remote["sync_info"]["latest_block_height"])-height)>5:
-                sys.exit(75)
-        print("Verified mainnet block and application hash at",height)
+    elif action=="head-verify": verify_head(args[0],int(args[1]))
     else: raise ValueError("unknown helper action")
 
-try:
-    main()
-except (OSError,KeyError) as exc:
-    if sys.argv[1]=="head-verify":
-        print("Witness data temporarily unavailable:",exc,file=sys.stderr)
-        sys.exit(75)
-    sys.exit("BeeHive: "+str(exc))
-except (ValueError,TypeError,IndexError) as exc:
-    sys.exit("BeeHive: "+str(exc))
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError,KeyError) as exc:
+        if sys.argv[1]=="head-verify":
+            print("Witness data temporarily unavailable:",exc,file=sys.stderr)
+            sys.exit(75)
+        sys.exit("BeeHive: "+str(exc))
+    except (ValueError,TypeError,IndexError) as exc:
+        sys.exit("BeeHive: "+str(exc))
 PYTHON
 }
 

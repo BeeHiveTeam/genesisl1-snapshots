@@ -13,11 +13,13 @@ jobs:
           persist-credentials: false
       - name: Verify source checksums and shell syntax
         run: |
+          python3 -B restore/build_client.py --check
           sha256sum --strict -c SHA256SUMS
           (cd restore && sha256sum --strict -c beehive-sync.sh.sha256)
           for script in producer/*.sh restore/*.sh; do bash -n "$script"; done
       - name: Test the restore client and stock SDK import
         run: |
+          if ! command -v lz4 >/dev/null; then sudo apt-get update && sudo apt-get install -y lz4; fi
           python3 -B -m unittest discover -v -s restore -p 'test_*.py'
           source restore/beehive-sync.sh
           job=$(mktemp -d "$RUNNER_TEMP/genesis-sdk.XXXXXXXX")

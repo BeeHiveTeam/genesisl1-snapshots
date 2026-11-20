@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+sync_user_agent='BeeHive-GenesisL1-Sync/1'
+
+banner() {
+    cat <<'BEEHIVE'
+  ____  _____ _____ _   _ _____     _______
+ | __ )| ____| ____| | | |_ _\ \   / / ____|
+ |  _ \|  _| |  _| | |_| || | \ \ / /|  _|
+ | |_) | |___| |___|  _  || |  \ V / | |___
+ |____/|_____|_____|_| |_|___|  \_/  |_____|
+BEEHIVE
+}
+
+
+# TOML parsing and streaming tar validation use the Python standard library.
+support() {
+    BEEHIVE_SYNC_AGENT="$sync_user_agent" python3 - "$@" <<'PYTHON'
+@BEEHIVE_RESTORE_HELPER@
+PYTHON
+}
+
+usage() {
+    cat <<'USAGE'
+BeeHive GenesisL1 snapshot sync
+  bash beehive-sync.sh                       inspect, choose a source, restore and follow mainnet
+  bash beehive-sync.sh --check               inspect the existing home and its local RPC
+  bash beehive-sync.sh --list                check snapshot providers and display archive sizes
+  bash beehive-sync.sh --plan                inspect, verify the selected checkpoint and show the plan
+  bash beehive-sync.sh --source beehive-native --target /mnt/data/l1-sync --yes
+
+Options
+  --inspect-home DIR   existing home to inspect (default ~/.genesis)
+  --target DIR         new private working directory (default ~/.beehive-genesisl1)
+  --source NAME        auto, beehive-native, beehive-full, lcserve, or firsttensor
+  --manifest URL       LCserve or FirstTensor HTTPS manifest in BeeHive format
+                       (see https://l1-snapshots.bee-hive.work:8545/native/latest.json)
+  --port-base PORT     three loopback ports (automatic selection starts at 36656)
+  --bin PATH           use this genesisd v1.6.2, otherwise use PATH or the official release
+  --yes                accept the displayed plan without a terminal prompt
+
+Run in tmux for long transfers. Repeat the same command to resume. Use Ctrl+C to stop
+this foreground node. It has its own home, keys and ports. Existing services keep running.
+Requires Linux, Bash, Python 3.11+, curl, jq, flock, sha256sum, tar and lz4 for full snapshots.
+The automatic binary download supports Linux x86-64. No system installation is performed.
+USAGE
+}
+
+die() { printf 'BeeHive: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null || die "Required command is missing: $1"; }
+field() { jq -er ".$1" <<<"$plan"; }
+mark() { printf '%s\n' "$1" >"$job/phase.next"; mv -T -- "$job/phase.next" "$job/phase"; phase=$1; }
+space() { df -B1 --output=avail -- "$job" | tail -1 | tr -d ' '; }
+check_sha() {
+    local sum
+    sum=$(sha256sum -- "$1")
+    [[ ${sum%% *} == "$2" ]]
+}
+https_get() {
+    curl --user-agent "$sync_user_agent" --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
+        --connect-timeout 12 --max-time 180 --max-filesize "$3" --output "$2" "$1"
+}
+show_sources() {
+    jq -r '.[] | if .error then "  \(.id)   unavailable — \(.error)" else
+        "  \(.id)   \(.kind)  \((.bytes/1000000000*100|round)/100) GB  height \(.height)" end' <<<"$catalog"
+}
+
+choose() {
+    catalog=$(support catalog "$source" "$manifest") || die "Cannot read source catalogue"
+    show_sources >&2
+    if [[ $action == run && $source == auto && $yes == 0 && -t 0 ]]; then
+        read -r -p 'Source name [auto selects the smallest available archive]: ' answer || exit 1
+        source=${answer:-auto}
+    fi
+    if [[ $source == auto ]]; then
+        plan=$(jq -ce '[.[]|select(.error==null)]|min_by(.bytes)|select(.!=null)' <<<"$catalog") || die "No usable snapshot"
+    else
+        plan=$(jq -ce --arg id "$source" '.[]|select(.id==$id and .error==null)' <<<"$catalog") || die "Requested snapshot is unavailable: $source"
+    fi
+    plan=$(support anchor "$plan") || die "Snapshot could not be verified against the independent RPCs"
+}
+
+get_binary() {
+    if [[ -n $bin_arg ]]; then
+        binary=$(realpath -e -- "$bin_arg") || die "genesisd binary not found"
+    elif command -v genesisd >/dev/null; then
+        binary=$(command -v genesisd)
+    else
+        binary="$job/genesisd"
+        if [[ ! -e $binary ]]; then
+            [[ $(uname -sm) == "Linux x86_64" ]] || die "Supply your platform's genesisd with --bin"
+            printf '%s\n' 'Downloading the official GenesisL1 v1.6.2 binary.'
+            https_get https://github.com/GenesisL1/genesis-crypto/releases/download/v1.6.2/genesis_1.6.2_Linux_x86_64.tar.gz \
+                "$job/release.part" 150000000
+            check_sha "$job/release.part" 1ee5232c372851aab81d95ee8f4cb08606c3efbb4aadcee227482a3cb46b75af || die "Release SHA-256 mismatch"
+            tar xOzf "$job/release.part" ./bin/genesisd >"$job/genesisd.part"
+            check_sha "$job/genesisd.part" ff126ed1cd19e3d604f9a822302b920ee20c6b68868796d2aab3c4f2d8d0f1f0 || die "Binary SHA-256 mismatch"
+            chmod 700 -- "$job/genesisd.part"
+            mv -T -- "$job/genesisd.part" "$binary"
+        fi
+        check_sha "$binary" ff126ed1cd19e3d604f9a822302b920ee20c6b68868796d2aab3c4f2d8d0f1f0 || die "Cached binary SHA-256 mismatch"
+    fi
+    local version
+    # This release also opens ~/.genesis while constructing its CLI, even for "version".
+    # Give just the child process its own real home as well as an explicit --home.
+    mkdir -p -- "$job/account"
+    daemon=(env "HOME=$job/account" "$binary")
+    version=$("${daemon[@]}" version) || die "Cannot run genesisd"
+    [[ ${version#v} == 1.6.2 ]] || die "This release supports genesisd v1.6.2; found $version"
+}
+
+prepare_home() {
+    local staging
+    if [[ ! -d $node ]]; then
+        staging=$(mktemp -d "$job/init.XXXXXXXX")
+        "${daemon[@]}" init BeeHive-Snapshot-Node --chain-id genesis_29-2 --home "$staging" >"$job/init.log" 2>&1
+        https_get https://raw.githubusercontent.com/GenesisL1/genesis-parameters/main/genesis_29-2/genesis.json \
+            "$staging/config/genesis.part" 33554432
+        check_sha "$staging/config/genesis.part" b8f6939f3bfaeec666c7efb94a683e9295e40705ef08af14d55014e4fa11757f || die "Wrong genesis file"
+        mv -T -- "$staging/config/genesis.part" "$staging/config/genesis.json"
+        support config "$staging" "$job/plan.json" "$port"
+        support identity "$staging" >"$staging/.beehive-created-identity"
+        if [[ $kind == native ]]; then
+            # Validate the checkpoint and bootstrap while it is still inside its trust period.
+            support anchor "$plan" >/dev/null
+            if ! "${daemon[@]}" comet bootstrap-state --height "$height" --home "$staging" >"$job/bootstrap.log" 2>&1; then
+                die "Light-client bootstrap failed. See $job/bootstrap.log"
+            fi
+            printf 'CometBFT light-client bootstrap verified at height %s.\n' "$height"
+            mkdir -- "$staging/bootstrap-backup"
+            local db
+            for db in state.db blockstore.db evidence.db; do
+                [[ ! -d "$staging/data/$db" ]] || cp -a -- "$staging/data/$db" "$staging/bootstrap-backup/"
+            done
+            [[ -d "$staging/bootstrap-backup/state.db" ]] || die "CometBFT bootstrap is incomplete"
+        fi
+        mv -T -- "$staging" "$node"
+    fi
+    mark ready
+}
+
+download() {
+    local bytes url hash part protocol current
+    bytes=$(field bytes); url=$(field url); hash=$(field sha256)
+    part="$archive.part"
+    protocol='=https'
+    [[ $url != http://85.122.195.176:31246/data_13985500.tar.lz4 ]] || protocol='=http,https'
+    if [[ ! -f $archive ]]; then
+        current=0; [[ ! -f $part ]] || current=$(stat -c %s -- "$part")
+        (( current <= bytes )) || die "The partial download is longer than the pinned archive"
+        if (( current < bytes )); then
+            printf 'Downloading %s, starting at byte %s of %s.\n' "$(field file)" "$current" "$bytes"
+            curl --user-agent "$sync_user_agent" --fail --location --show-error --progress-bar --proto "$protocol" --proto-redir '=https' \
+                --connect-timeout 15 --speed-limit 1024 --speed-time 180 --retry 3 \
+                --max-filesize "$bytes" --continue-at - --output "$part" "$url"
+        fi
+        [[ $(stat -c %s -- "$part") == "$bytes" ]] || die "Incomplete download. Run the same command to resume."
+        if ! check_sha "$part" "$hash"; then
+            mv -T -- "$part" "$part.rejected.$(date +%s)"
+            die "Archive SHA-256 mismatch. Rejected data was set aside; run again after checking the source."
+        fi
+        mv -T -- "$part" "$archive"
+    else
+        [[ $(stat -c %s -- "$archive") == "$bytes" ]] && check_sha "$archive" "$hash" || die "Cached archive SHA-256 mismatch"
+    fi
+    printf 'Verified SHA-256 %s\n' "$hash"
+    mark downloaded
+}
+
+# Move aside only interrupted, script-created paths before the node's first start.
+# Preserving these files lets the operator inspect them and recover the disk space.
+set_aside() {
+    local path=$1 backup
+    [[ ! -e $path ]] && return 0
+    backup=$(mktemp -d "$job/interrupted.XXXXXXXX")
+    mv -T -- "$path" "$backup/$(basename -- "$path")"
+    printf 'Preserved incomplete work in %s\n' "$backup" >&2
+}
+
+install_full() {
+    local staging="$job/unpack" spare budget
+    if [[ ! -e "$job/full-extracted" ]]; then
+        set_aside "$staging"
+        mkdir -- "$staging"
+        spare=$(space); budget=$((spare-10*1024*1024*1024))
+        (( budget > 0 )) || die "Insufficient free space for extraction"
+        support extract "$archive" "$staging" "$budget"
+        touch "$job/full-extracted"
+    fi
+    if [[ ! -d "$job/fresh-data" ]]; then
+        [[ $(find "$node/data" -mindepth 1 -maxdepth 1 -printf '%f\n') == priv_validator_state.json ]] || die "Unexpected existing node database"
+        jq -e '(.height|tonumber)==0' "$node/data/priv_validator_state.json" >/dev/null || die "The new node has signing history"
+        mv -T -- "$node/data" "$job/fresh-data"
+    fi
+    if [[ ! -d "$node/data" ]]; then
+        cp -- "$job/fresh-data/priv_validator_state.json" "$staging/data/priv_validator_state.json"
+        mv -T -- "$staging/data" "$node/data"
+    fi
+    mark restored
+}
+
+native_restore() {
+    local chunks
+    chunks=$(field chunks)
+    if [[ $phase == downloaded ]]; then mark loading; fi
+    if [[ $phase == loading ]]; then
+        if ! "${daemon[@]}" snapshots list --home "$node" 2>&1 | grep -F "height: $height format: 3 chunks: $chunks" >/dev/null; then
+            set_aside "$node/data/snapshots"
+            "${daemon[@]}" snapshots load "$archive" --home "$node"
+            "${daemon[@]}" snapshots list --home "$node" 2>&1 | grep -F "height: $height format: 3 chunks: $chunks" >/dev/null || die "SDK chunk count or format differs"
+        fi
+        mark loaded
+    fi
+    if [[ $phase == restoring ]]; then
+        set_aside "$node/data/application.db"
+        set_aside "$node/data/memiavl.db"
+    fi
+    mark restoring
+    "${daemon[@]}" snapshots restore "$height" 3 --home "$node"
+    support memiavl "$node" "$height" "$(field app_hash)"
+    mark restored
+}
+
+recover_checkpoint() {
+    local db path backup="$job/before-first-block" checkpoint="$node/bootstrap-backup"
+    [[ $kind == native && ! -e "$job/snapshot-proof" && ! -e "$job/checkpoint-replayed" ]] || return 1
+    [[ -d "$checkpoint/state.db" && ! -L $checkpoint && ! -L $node/data ]] || return 1
+    jq -e '(.height|tonumber)==0' "$node/data/priv_validator_state.json" >/dev/null || return 1
+    if [[ ! -e "$job/replay-pending" ]]; then
+        tail -c 65536 "$job/node.log" | grep -F "state ($height) and store (0) height mismatch" >/dev/null || return 1
+        [[ ! -e $backup ]] || return 1
+        touch "$job/replay-pending" || return 1
+    fi
+    mkdir -p -- "$backup" || return 1
+    for db in state.db blockstore.db evidence.db; do
+        path="$node/data/$db"
+        [[ ! -L $path && ! -L "$checkpoint/$db" ]] || return 1
+        if [[ ! -e "$backup/moved-$db" ]]; then
+            if [[ -d $path && ! -e "$backup/$db" ]]; then mv -T -- "$path" "$backup/$db" || return 1; fi
+            touch "$backup/moved-$db" || return 1
+        fi
+        if [[ -d "$checkpoint/$db" && ! -e $path ]]; then
+            local temp; temp=$(mktemp -d "$job/checkpoint.XXXXXXXX") || return 1
+            cp -a -- "$checkpoint/$db" "$temp/$db" && mv -T -- "$temp/$db" "$path" || return 1
+        fi
+    done
+    mv -T -- "$job/replay-pending" "$job/checkpoint-replayed" || return 1
+    printf '%s\n' 'Recovered the saved pre-first-block CometBFT checkpoint.'
+}
+
+follow() {
+    local pid rpc_url stat current caught ancestor after snapshot_seen=0 verified=0 rc=0
+    rpc_url="http://127.0.0.1:$((port+1))"
+    if [[ -e "$job/replay-pending" ]]; then recover_checkpoint || die "Could not finish checkpoint recovery"; fi
+    if [[ -f "$job/snapshot-proof" && $(cat -- "$job/snapshot-proof") == "$(field app_hash)" ]]; then snapshot_seen=1; fi
+    support ports "$port"
+    "${daemon[@]}" start --home "$node" --log_level warn >>"$job/node.log" 2>&1 &
+    pid=$!
+    trap 'kill -TERM "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+    trap 'exit 130' INT TERM
+    printf 'Following mainnet. Local RPC %s  •  Node log %s/node.log\n' "$rpc_url" "$job"
+    while kill -0 "$pid" 2>/dev/null; do
+        if stat=$(curl --noproxy '*' -fsS --max-time 3 "$rpc_url/status" 2>/dev/null) &&
+            current=$(jq -er '.result | select(.node_info.network=="genesis_29-2")|.sync_info.latest_block_height|tonumber' <<<"$stat"); then
+            jq -e --arg addr "$(jq -r .address <<<"$expected_identity")" \
+                '.result.validator_info|.address==$addr and (.voting_power|tonumber)==0' <<<"$stat" >/dev/null || die "Unexpected node signer or voting power"
+            caught=$(jq -r '.result.sync_info.catching_up' <<<"$stat")
+            if (( current >= height+1 && ! snapshot_seen )); then
+                if after=$(curl --noproxy '*' -fsS --max-time 6 "$rpc_url/commit?height=$((height+1))" | jq -er '.result.signed_header.header.app_hash'); then
+                    [[ ${after^^} == "$(field app_hash)" ]] || die "Local AppHash at H+1 disagrees with the pinned snapshot"
+                    snapshot_seen=1
+                    printf '%s\n' "$after" >"$job/snapshot-proof"
+                fi
+            fi
+            if [[ $caught == false ]] && (( snapshot_seen && ! verified )); then
+                ancestor=$((current-1))
+                if support head-verify "$rpc_url" "$ancestor"; then
+                    printf 'Caught up to GenesisL1 at height %s. The node will continue running.\n' "$current"
+                    verified=1
+                    printf '%s\n' "$current" >"$job/verified-height"
+                else
+                    rc=$?
+                    (( rc == 75 )) || die "Witness verification failed; the new node has been stopped"
+                fi
+            fi
+            if (( ! verified )); then printf 'Height %s  •  catching_up=%s\n' "$current" "$caught"; fi
+        fi
+        sleep 10
+    done
+    rc=0
+    wait "$pid" || rc=$?
+    trap - EXIT INT TERM
+    if (( rc )); then
+        if recover_checkpoint; then follow; return; fi
+        tail -n 12 -- "$job/node.log" >&2
+    fi
+    return "$rc"
+}
+
+main() {
+    banner >&2
+    local home_root=${HOME:-} observed target source=auto manifest='' action=run yes=0 port=36656 port_set=0 bin_arg='' answer
+    if [[ -z $home_root ]]; then home_root=$(getent passwd "$(id -u)" | cut -d: -f6); fi
+    observed="$home_root/.genesis"; target="$home_root/.beehive-genesisl1"
+    while (($#)); do
+        case "$1" in
+            --help|-h) usage; return;;
+            --check) action=check;;
+            --list) action=list;;
+            --plan) action=plan;;
+            --yes) yes=1;;
+            --source|--manifest|--inspect-home|--target|--port-base|--bin)
+                (($#>=2)) && [[ -n $2 && $2 != --* ]] || die "Value required for $1"
+                case "$1" in
+                    --source) source=$2;; --manifest) manifest=$2;; --inspect-home) observed=$2;; --target) target=$2;;
+                    --port-base) port=$2; port_set=1;; --bin) bin_arg=$2;;
+                esac
+                shift;;
+            *) die "Unknown option: $1 (see --help)";;
+        esac
+        shift
+    done
+    case "$source" in auto|beehive-native|beehive-full|lcserve|firsttensor) ;; *) die "Unknown source: $source";; esac
+    [[ -z $manifest || $source == lcserve || $source == firsttensor ]] || die "Use --manifest with --source lcserve or firsttensor"
+    need python3; python3 -c 'import tomllib' 2>/dev/null || die "Python 3.11+ is required"
+    if [[ $action != list ]]; then support inspect "$observed"; fi
+    [[ $action != check ]] || return 0
+    need jq
+    local catalog plan job node archive phase kind height binary room needed size existing filename
+    local -a daemon
+    if [[ $action == list ]]; then catalog=$(support catalog "$source" "$manifest"); show_sources; return; fi
+    [[ $port =~ ^[1-9][0-9]{3,4}$ ]] || die "Invalid port number"
+    for cmd in curl sha256sum tar flock realpath; do need "$cmd"; done
+    job=$(realpath -ms -- "$target"); observed=$(realpath -m -- "$observed")
+    support target "$job" "$observed"
+    local previous=0
+    if [[ -f "$job/.beehive-genesisl1-v1" && -f "$job/plan.json" ]]; then
+        plan=$(jq -ce . "$job/plan.json")
+        [[ $source == auto || $(field id) == "$source" ]] || die "This target already has a pinned source; use a new target"
+        local saved_port; saved_port=$(field port)
+        (( ! port_set || port == saved_port )) || die "This target already has a different port base"
+        port=$saved_port; previous=1
+    else
+        choose
+        if (( ! port_set )); then port=$(support pick-port); fi
+    fi
+    filename=$(field file); height=$(field height); kind=$(field kind); size=$(field bytes)
+    [[ $filename =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ && $height =~ ^[1-9][0-9]{0,14}$ && $size =~ ^[1-9][0-9]{0,13}$ ]] || die "Invalid pinned snapshot metadata"
+    [[ $kind == full || $kind == native ]] || die "Unknown snapshot format"
+    node="$job/node"; archive="$job/$filename"
+    [[ ! -L $archive && ! -L $archive.part ]] || die "Unexpected symlink in archive cache"
+    [[ $kind != full ]] || need lz4
+    printf 'Selected %s, %s, height %s, %s bytes.\nTarget %s   RPC 127.0.0.1:%s\n' "$(field id)" "$kind" "$height" "$size" "$job" "$((port+1))"
+    if [[ $action == plan ]]; then
+        if (( previous )); then printf '%s\n' 'Showing the existing pinned job.'; fi
+        return 0
+    fi
+    if (( ! yes )); then
+        [[ -t 0 ]] || die "An interactive terminal or --yes is required to start"
+        read -r -p 'Start or resume this independent node? [y/N] ' answer || exit 1
+        [[ $answer == [yY] || $answer == [yY][eE][sS] ]] || return 0
+    fi
+    support ports "$port"
+    if [[ ! -e $job ]]; then mkdir --mode=0700 -- "$job"; fi
+    exec 8<"$job"
+    flock -n 8 || die "Another run owns this target"
+    support target "$job" "$observed"
+    if [[ ! -f "$job/.beehive-genesisl1-v1" ]]; then
+        chmod 700 -- "$job"
+        printf '%s\n' genesis_29-2 >"$job/.beehive-genesisl1-v1"
+    fi
+    if (( ! previous )); then
+        [[ ! -e "$job/plan.json" ]] || die "Another run selected a source; rerun to resume its pinned plan"
+        jq --argjson port "$port" '.+{port:$port}' <<<"$plan" >"$job/plan.next"
+        mv -T -- "$job/plan.next" "$job/plan.json"
+    fi
+    phase=new; [[ ! -e "$job/phase" ]] || read -r phase <"$job/phase"
+    case "$phase" in new|ready|downloaded|loading|loaded|restoring|restored) ;; *) die "Unknown saved phase: $phase";; esac
+    if [[ $phase == new || $phase == ready ]]; then
+        room=$(space); existing=0
+        if [[ -f $archive ]]; then existing=$(stat -c %s -- "$archive"); elif [[ -f $archive.part ]]; then existing=$(stat -c %s -- "$archive.part"); fi
+        if [[ $kind == native ]]; then needed=$((size + 380*1024*1024*1024)); else needed=$((size+size*115/100+10*1024*1024*1024)); fi
+        (( room+existing >= needed )) || die "Available space is below the estimate of $needed bytes including the download and restored database"
+    fi
+    get_binary
+    if [[ $phase == new ]]; then prepare_home; fi
+    local expected_identity live_identity
+    expected_identity=$(cat -- "$node/.beehive-created-identity")
+    live_identity=$(support identity "$node")
+    [[ $live_identity == "$expected_identity" ]] || die "Configuration or signer differs from the new node created by this run"
+    if [[ $phase == ready ]]; then download; fi
+    if [[ $phase != restored ]]; then
+        if [[ $kind == full ]]; then install_full; else native_restore; fi
+    fi
+    follow
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

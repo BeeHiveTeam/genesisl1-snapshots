@@ -32,3 +32,5 @@ bash restore/beehive-sync.sh --source beehive-native \
 Repeat the same command with the same target after an interruption. The script operates on a separate node home with its own keys and ports. Check that the receiver matches witnesses and catches up to the changing mainnet head. The Native checkpoint must have more than one hour of trust remaining for a new plan. Other source choices and the interactive `auto` option are described by `bash restore/beehive-sync.sh --help`. [Current Native manifest](https://l1-snapshots.bee-hive.work:8545/native/latest.json)
 
 The restore script checks the checkpoint and final block against the CometBFT RPCs at `https://26657.genesisl1.org` and `https://rpc.genesisl1.firsttensor.com`. The producer uses the same first witness and anode.team as its second witness at publication.
+
+The downloadable Bash script includes its Python helper and can run by itself. To change the client, edit `restore/client.sh.in` or `restore/helper.py` and regenerate the script and its checksum with `python3 restore/build_client.py`. CI checks that both generated files match their sources.
