@@ -17,6 +17,7 @@ class RestoreWitnesses(unittest.TestCase):
         self.modify = None
         self.latest = 105
         self.unbonding = "604800s"
+        self.status_network = {}
         self.row = {"kind":"native", "height":100, "app_hash":f"{1101:064X}",
                     "trust_height":99, "trust_hash":f"{99:064X}", "hours":144}
         for mock in (patch.object(helper,"rpc",side_effect=self.rpc),
@@ -28,7 +29,8 @@ class RestoreWitnesses(unittest.TestCase):
 
     def rpc(self, server, method):
         if method == "status":
-            return {"node_info":{"network":helper.CHAIN}, "sync_info":{"latest_block_height":str(self.latest)}}
+            return {"node_info":{"network":self.status_network.get(server, helper.CHAIN)},
+                    "sync_info":{"latest_block_height":str(self.latest)}}
         height = int(method.split("=")[1])
         header = {"chain_id":helper.CHAIN, "height":str(height), "time":self.stamp,"app_hash":f"{height+1000:064X}"}
         commit = {"height":str(height), "block_id":{"hash":f"{height:064X}"}}
@@ -76,6 +78,12 @@ class RestoreWitnesses(unittest.TestCase):
             with self.assertRaises(SystemExit) as wait:
                 helper.verify_head("local",100)
             self.assertEqual(wait.exception.code,75)
+
+    def test_wrong_status_chain_of_either_witness_rejects_matching_blocks(self):
+        for server in helper.RPCS:
+            self.status_network = {server: "other-chain"}
+            with self.subTest(server=server), self.assertRaisesRegex(ValueError, "wrong witness chain"):
+                helper.verify_head("local", 100)
 
 
 class SourceChoice(unittest.TestCase):

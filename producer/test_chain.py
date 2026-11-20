@@ -1,6 +1,9 @@
 """Exercise the production witness comparison with independent RPC response fixtures."""
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+import os
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -45,6 +48,8 @@ class Witnesses(unittest.TestCase):
         self.assertEqual(Counter(self.calls), Counter([chain.PARAMS] +
                          [f"{s}/commit?height={h}" for s in chain.WITNESSES for h in range(104,108)]))
         self.assertEqual(proof["block_hash"], f"{105:064X}")
+        self.assertEqual(chain.parse_time(proof["snapshot_block_time_utc"]),
+                         self.now - self.age + timedelta(seconds=1))
         self.assertEqual(proof["snapshot_app_hash"], f"{1106:064X}")
         self.assertEqual(proof["fixed_trust_anchor"]["hash"], f"{104:064X}")
         self.assertEqual(proof["fixed_trust_anchor"]["height"], 104)
@@ -98,8 +103,59 @@ class Witnesses(unittest.TestCase):
             self.agree()
         self.assertNotIn(chain.PARAMS,self.calls)
 
+    def test_wait_retries_transient_failure_and_verifies_the_recovered_witness(self):
+        witness = chain.WITNESSES[1]
+        retry_url = f"{witness}/commit?height={self.height}"
+
+        def fail_once(server, height, header, commit):
+            if server == witness and height == self.height and self.calls.count(retry_url) == 1:
+                raise OSError("temporary disconnection")
+
+        self.modify = fail_once
+        with patch.object(chain.time, "sleep") as sleep:
+            proof = chain.agree(self.height, f"{self.height + 1001:064X}", wait=True)
+        sleep.assert_called_once()
+        self.assertEqual(self.calls.count(retry_url), 2)
+        self.assertIn(f"{witness}/commit?height={self.height + 2}", self.calls)
+        self.assertEqual(proof["block_hash"], f"{self.height:064X}")
+
 
 class ReplicaChecks(unittest.TestCase):
+    def test_listener_and_flock_must_belong_to_the_same_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "application.db"
+            database.mkdir()
+            lock = database / "LOCK"
+            lock.touch()
+            info = lock.stat()
+            key = f"{os.major(info.st_dev):02x}:{os.minor(info.st_dev):02x}:{info.st_ino}"
+            proc = root / "proc"
+            fds = proc / "4321" / "fd"
+            fds.mkdir(parents=True)
+            (proc / "locks").write_text(f"1: FLOCK ADVISORY WRITE 4321 {key} 0 EOF\n")
+            network = proc / "net"
+            network.mkdir()
+            port = 27777
+            (network / "tcp").write_text(
+                "sl local_address rem_address st tx_queue tr retrnsmt uid timeout inode\n"
+                f"0: 0100007F:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 777\n"
+                f"1: 0100007F:{port:04X} 0100007F:ABCD 01 00000000:00000000 00:00000000 00000000 1000 0 888\n"
+            )
+            fd = fds / "9"
+            fd.symlink_to("socket:[777]")
+            with patch.object(chain, "Path", side_effect=lambda path: proc / Path(path).relative_to("/proc")):
+                self.assertEqual(chain.local_pid(database, port), 4321)
+                with self.assertRaisesRegex(ValueError, "different processes"):
+                    chain.local_pid(database, port + 1)
+                fd.unlink()
+                fd.symlink_to("socket:[888]")
+                with self.assertRaisesRegex(ValueError, "different processes"):
+                    chain.local_pid(database, port)
+                (proc / "locks").write_text(f"1: POSIX ADVISORY WRITE 4321 {key} 0 EOF\n")
+                with self.assertRaisesRegex(ValueError, "owning this database"):
+                    chain.local_pid(database, port)
+
     def test_only_current_nonsigning_replica_with_expected_id_and_version(self):
         cfg = SimpleNamespace(db="fixture", rpc="http://127.0.0.1:27777", node_id="abcd")
         now = datetime(2025,5,10,tzinfo=timezone.utc)

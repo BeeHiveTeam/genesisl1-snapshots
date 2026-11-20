@@ -2,9 +2,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"cosmossdk.io/log"
@@ -15,7 +21,128 @@ import (
 	storetypes "cosmossdk.io/store/types"
 	db "github.com/cosmos/cosmos-db"
 	iavltree "github.com/cosmos/iavl"
+	iavldb "github.com/cosmos/iavl/db"
 )
+
+func TestCLIRejectsMissingSource(t *testing.T) {
+	const marker = "BEEHIVE_EXPORTER_TEST_CLI"
+	if os.Getenv(marker) == "1" {
+		os.Args = []string{"native-export"}
+		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+		main()
+		return
+	}
+
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "-test.run=^TestCLIRejectsMissingSource$")
+	cmd.Dir = t.TempDir()
+	cmd.Env = append(os.Environ(), marker+"=1")
+	stdout, err := cmd.Output()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+		t.Fatalf("CLI without a source returned %v, stdout: %s", err, stdout)
+	}
+	if len(stdout) != 0 || !bytes.Contains(exit.Stderr, []byte("source")) {
+		t.Fatalf("CLI did not report a missing source on stderr: stdout=%q stderr=%q", stdout, exit.Stderr)
+	}
+}
+
+type readFaultDB struct {
+	iavldb.DB
+	readErr error
+}
+
+func (db *readFaultDB) Get(key []byte) ([]byte, error) {
+	if db.readErr != nil {
+		return nil, db.readErr
+	}
+	return db.DB.Get(key)
+}
+
+func TestParallelExportReturnsWorkerReadError(t *testing.T) {
+	if err := iavltree.SetExportWorkers(2); err != nil {
+		t.Fatal(err)
+	}
+	defer iavltree.SetExportWorkers(1)
+
+	database := &readFaultDB{DB: iavldb.NewMemDB()}
+	tree := iavltree.NewMutableTree(database.DB, 0, true, iavltree.NewNopLogger())
+	defer tree.Close()
+	for _, key := range []string{"blue", "green"} {
+		if _, err := tree.Set([]byte(key), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, version, err := tree.SaveVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reopen to load only the root. The worker has to fetch its children.
+	reader := iavltree.NewMutableTree(database, 0, true, iavltree.NewNopLogger())
+	defer reader.Close()
+	frozen, err := reader.GetImmutable(version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database.readErr = errors.New("fixture could not read the child node")
+	exporter, err := frozen.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exporter.Close()
+	// IAVL includes the underlying read error in its own diagnostic.
+	if node, err := exporter.Next(); node != nil || err == nil || !strings.Contains(err.Error(), database.readErr.Error()) {
+		t.Fatalf("expected the worker read failure, got node=%v err=%v", node, err)
+	}
+}
+
+func TestExportWorkerBounds(t *testing.T) {
+	defer iavltree.SetExportWorkers(1)
+	for _, count := range []int{0, 1, 64, 65} {
+		wantValid := count == 1 || count == 64
+		if err := iavltree.SetExportWorkers(count); (err == nil) != wantValid {
+			t.Errorf("SetExportWorkers(%d) returned %v, want valid=%v", count, err, wantValid)
+		}
+	}
+}
+
+func TestBenchmarkStopsAtEVMLimit(t *testing.T) {
+	chunks := make(chan io.ReadCloser)
+	stream := snapshots.NewStreamWriter(chunks)
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for chunk := range chunks {
+			if _, err := io.Copy(io.Discard, chunk); err != nil {
+				t.Errorf("reading benchmark output: %v", err)
+			}
+			chunk.Close()
+		}
+	}()
+	t.Cleanup(func() {
+		if err := stream.Close(); err != nil {
+			t.Errorf("closing benchmark output: %v", err)
+		}
+		<-drained
+	})
+	writer := &progressWriter{stream: stream, store: "evm", limit: 3, sample: sha256.New()}
+	item := &snapshottypes.SnapshotItem{
+		Item: &snapshottypes.SnapshotItem_IAVL{IAVL: &snapshottypes.SnapshotIAVLItem{
+			Key: []byte("key"), Value: []byte("value"), Version: 1,
+		}},
+	}
+	for i := 1; i < 3; i++ {
+		if err := writer.WriteMsg(item); err != nil {
+			t.Fatalf("benchmark stopped early at node %d: %v", i, err)
+		}
+	}
+	if err := writer.WriteMsg(item); !errors.Is(err, errBenchmarkComplete) {
+		t.Fatalf("benchmark reached node 3, got %v, want completion", err)
+	}
+}
 
 func TestReadOnlyExportMatchesSDKAndRestores(t *testing.T) {
 	if err := iavltree.SetExportWorkers(1); err != nil {
@@ -62,6 +189,18 @@ func TestReadOnlyExportMatchesSDKAndRestores(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer source.Close()
+	t.Run("source rejects writes", func(t *testing.T) {
+		key := []byte("exporter-readonly-probe")
+		if found, err := source.Has(key); err != nil || found {
+			t.Fatalf("expected a readable database and an unused key: found=%v err=%v", found, err)
+		}
+		if err := source.Set(key, []byte("test")); err == nil {
+			t.Fatal("exporter's source handle accepted a write")
+		}
+		if found, err := source.Has(key); err != nil || found {
+			t.Fatalf("after rejected write: found=%v err=%v", found, err)
+		}
+	})
 	if !bytes.Equal(readonly.LastCommitID().Hash, commit.Hash) {
 		t.Fatal("read-only store loaded a different application hash")
 	}

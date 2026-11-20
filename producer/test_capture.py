@@ -44,6 +44,22 @@ class Capture(unittest.TestCase):
         self.assertEqual((self.dst/"4.log").read_bytes(), b"new generation")
         self.assertEqual((self.src/"4.log").read_bytes(), b"new generation")
 
+    def test_pin_accepts_existing_hardlink_but_rejects_a_different_inode(self):
+        self.dst.mkdir()
+        source = self.src / "1.sst"
+        target = self.dst / source.name
+        target.write_bytes(source.read_bytes())
+        pinned = set()
+        with self.assertRaisesRegex(RuntimeError, "changed inode"):
+            capture.pin(self.src, self.dst, {source.name}, pinned)
+        self.assertEqual(pinned, set())
+        self.assertFalse(target.samefile(source))
+
+        target.unlink()
+        target.hardlink_to(source)
+        capture.pin(self.src, self.dst, {source.name}, pinned)
+        self.assertEqual(pinned, {source.name})
+
     def test_existing_destination_and_source_overlap_are_preserved(self):
         self.dst.mkdir()
         kept = self.dst/"existing"

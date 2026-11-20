@@ -336,17 +336,31 @@ def build(c):
         log("ready_to_publish", height=h, chunks=snapshot["chunks"])
 
 
-def intact_edition(public, manifest, owner):
+def file_version(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def verify_retained_files(public, manifest, owner):
     name = manifest["file"]
     checksum = (manifest["sha256"] + "  " + name + "\n").encode()
-    try:
-        for path, size in ((public / name, manifest["bytes"]), (public / (name + ".sha256"), len(checksum))):
-            info = path.lstat()
-            if info.st_uid != owner or not stat.S_ISREG(info.st_mode) or info.st_size != size:
-                return False
-        return (public / (name + ".sha256")).read_bytes() == checksum
-    except FileNotFoundError:
-        return False
+    archive_path = public / name
+    versions = {}
+    # Do not follow a replacement symlink or block on a FIFO.
+    for path, size in ((public / (name + ".sha256"), len(checksum)), (archive_path, manifest["bytes"])):
+        info = path.lstat()
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == owner and info.st_size == size,
+                f"Unexpected type, owner or size for {path.name}")
+        versions[path] = file_version(info)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            require(file_version(os.fstat(fd)) == versions[path], f"{path.name} changed before verification")
+            if path == archive_path:
+                require(hashlib.file_digest(stream, "sha256").hexdigest() == manifest["sha256"],
+                        f"Archive SHA-256 mismatch for {name}")
+            else:
+                require(stream.read(len(checksum) + 1) == checksum, f"Checksum file mismatch for {name}")
+    return versions
 
 
 def retire(public, height):
@@ -376,18 +390,30 @@ def retire(public, height):
             deadline = max(published + timedelta(days=7), expires + timedelta(days=1))
         except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
             continue
-        candidates.append((h, path, manifest, deadline))
+        candidates.append((h, path, manifest, deadline, file_version(info)))
 
     candidates.sort(key=lambda row: row[0], reverse=True)
-    if len(candidates) <= 2:
+    cutoff = now()
+    expired = [row for row in candidates[2:] if row[3] <= cutoff]
+    if not expired:
         return
-    if candidates[0][0] != height or not all(intact_edition(public, row[2], owner) for row in candidates[:2]):
-        log("retention_deferred", height=height, reason="newest two archives or checksums incomplete")
+    if candidates[0][0] != height:
+        log("retention_deferred", height=height, reason="current manifest unavailable")
         return
-    for _, path, manifest, deadline in candidates[2:]:
+    versions = {}
+    try:
+        for _, path, manifest, _, version in candidates[:2]:
+            versions[path] = version
+            versions.update(verify_retained_files(public, manifest, owner))
+        # Reading large archives takes time. Recheck both complete editions
+        # together, while holding the publisher lock, before the first unlink.
+        for path, version in versions.items():
+            require(file_version(path.lstat()) == version, f"{path.name} changed during verification")
+    except (OSError, ValueError) as exc:
+        log("retention_deferred", height=height, reason=str(exc))
+        return
+    for _, path, manifest, _, _ in expired:
         name = manifest["file"]
-        if now() < deadline:
-            continue
         files = [public / name, public / (name + ".sha256"), path]
         # A partial earlier cleanup may have left just the manifest. A foreign
         # file or a link at any of these names keeps the whole edition intact.

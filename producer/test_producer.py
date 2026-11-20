@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -62,6 +63,62 @@ class ProducerTest(unittest.TestCase):
             with self.subTest(number=number):
                 self.assertEqual(archive.varint(number), bytes.fromhex(encoded))
 
+    def test_sdk_metadata_rejects_unsupported_format(self):
+        with self.assertRaisesRegex(ValueError, "format"):
+            archive.sdk_metadata({**self.snap, "format": 4})
+
+    def test_put_syncs_contents_before_replace_then_syncs_parent(self):
+        destination = self.root / "pointer.json"
+        destination.write_text("previous")
+        events = []
+        fsync, replace = os.fsync, os.replace
+
+        def sync_fd(fd):
+            info = os.fstat(fd)
+            if stat.S_ISDIR(info.st_mode):
+                self.assertTrue(os.path.samestat(info, destination.parent.stat()))
+                events.append(("directory fsync", destination.stat().st_ino))
+            else:
+                self.assertTrue(stat.S_ISREG(info.st_mode))
+                self.assertEqual(os.pread(fd, 16, 0), b"replacement")
+                events.append(("file fsync", info.st_ino))
+            fsync(fd)
+
+        def replace_file(source, target):
+            self.assertEqual(target, destination)
+            self.assertEqual(target.read_text(), "previous")
+            events.append(("replace", source.stat().st_ino))
+            replace(source, target)
+
+        with patch.object(os, "fsync", sync_fd), patch.object(os, "replace", replace_file):
+            p.put(destination, "replacement")
+        inode = destination.stat().st_ino
+        self.assertEqual(events, [("file fsync", inode), ("replace", inode), ("directory fsync", inode)])
+        self.assertEqual(destination.read_text(), "replacement")
+
+    def test_failed_file_sync_leaves_previous_pointer_in_place(self):
+        destination = self.root / "pointer.json"
+        destination.write_text("previous")
+        with patch.object(os, "fsync", side_effect=OSError("fixture sync failure")), \
+             self.assertRaisesRegex(OSError, "fixture sync failure"):
+            p.put(destination, "replacement")
+        self.assertEqual(destination.read_text(), "previous")
+        self.assertEqual(list(self.root.glob(".native-tmp-*")), [])
+
+    def test_export_terminates_child_when_only_two_gib_are_available(self):
+        with patch.object(p.subprocess, "Popen") as launch, patch.object(self.c, "space") as space, \
+             patch.object(Path, "read_text", autospec=True, return_value="MemAvailable: 2097152 kB\n") as ram:
+            child = launch.return_value
+            child.wait.side_effect = [subprocess.TimeoutExpired("exporter", 30), 0]
+            child.poll.side_effect = lambda: None if child.wait.call_count == 1 else 0
+            with self.assertRaisesRegex(ValueError, "available memory"):
+                p.export_monitored(self.c, self.root / "frozen", self.dest, subprocess.DEVNULL)
+        space.assert_called_once_with(self.c.work)
+        ram.assert_called_once_with(Path("/proc/meminfo"))
+        child.terminate.assert_called_once_with()
+        self.assertEqual(child.wait.call_args_list, [call(timeout=30), call(timeout=15)])
+        child.kill.assert_not_called()
+
     def test_publish_and_fail_closed(self):
         c = self.c
         previous = {"chain_id":p.CHAIN,"snapshot_format":3,"snapshot_height":80,"file":p.filename(80),"bytes":3}
@@ -98,6 +155,31 @@ class ProducerTest(unittest.TestCase):
                 p.publish(self.c)
             self.assertFalse(self.c.latest.exists())
             self.assertFalse((self.c.public/p.filename(100)).exists())
+
+    def test_publish_retires_only_after_committing_the_new_public_pointer(self):
+        c = self.c
+        put = p.put
+
+        def reject_pointer(path, data, mode):
+            if path == c.latest:
+                raise OSError("fixture pointer write failed")
+            put(path, data, mode)
+
+        def check_visible_edition(directory, height):
+            latest = p.read(c.latest)
+            self.assertEqual(latest["snapshot_height"], height)
+            archive_path = directory / latest["file"]
+            self.assertEqual(latest["sha256"], p.sha(archive_path))
+            self.assertEqual(p.read(directory / archive_path.name.replace(".tar.gz", ".json")), latest)
+
+        with patch.object(p, "agree", return_value=self.proof), patch.object(c, "space"), \
+             patch.object(p, "log"), patch.object(p, "retire", side_effect=check_visible_edition) as retire:
+            with patch.object(p, "put", side_effect=reject_pointer), self.assertRaisesRegex(OSError, "pointer write"):
+                p.publish(c)
+            retire.assert_not_called()
+            self.assertFalse(c.latest.exists())
+            p.publish(c)
+            retire.assert_called_once_with(c.public, self.snap["height"])
 
     def test_build_space_tracks_previous_export_and_table_growth(self):
         c = self.c

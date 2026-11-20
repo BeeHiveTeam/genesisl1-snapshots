@@ -5,8 +5,10 @@ import json
 import shutil
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -65,6 +67,22 @@ class BootstrapTests(unittest.TestCase):
         helper.check_target(self.root/"fresh",observed)
         self.assertTrue((bad/"existing-data").exists())
 
+    def test_even_an_empty_inspected_home_is_separate_from_the_target(self):
+        observed = self.root / "empty-home"
+        observed.mkdir()
+        for target in (observed, observed / "child", observed.parent):
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "separate"):
+                helper.check_target(target, observed)
+
+    def test_build_from_sources_creates_client_and_checksum(self):
+        for name in ("client.sh.in", "helper.py", "build_client.py"):
+            shutil.copyfile(SCRIPT.with_name(name), self.root / name)
+        subprocess.run([sys.executable, "-B", "build_client.py"], cwd=self.root, check=True)
+        client = self.root / SCRIPT.name
+        self.assertEqual(client.read_bytes(), SCRIPT.read_bytes())
+        digest = hashlib.sha256(client.read_bytes()).hexdigest()
+        self.assertEqual(client.with_suffix(".sh.sha256").read_text(), f"{digest}  {client.name}\n")
+
     def test_provider_catalog_contract(self):
         meta={"chain_id":"genesis_29-2","file":"example.tar.lz4","height":123,"version":"v1.6.2","bytes":7,
               "sha256":"11"*32,"app_hash":"22"*32,"block_hash":"33"*32,"memiavl_enabled":False,"versiondb_enabled":False}
@@ -119,18 +137,86 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             helper.change_toml(f,{("missing","enable"):True})
 
-    def test_app_hash_from_mainnet_store_roots(self):
+    def test_native_configuration_keeps_p2p_state_sync_disabled(self):
+        config = self.root / "config"
+        config.mkdir()
+        comet = config / "config.toml"
+        comet.write_text('''proxy_app = ""
+[rpc]
+laddr = ""
+pprof_laddr = ""
+grpc_laddr = ""
+[p2p]
+laddr = ""
+persistent_peers = ""
+max_packet_msg_payload_size = 1024
+[statesync]
+enable = true
+rpc_servers = ""
+trust_height = 0
+trust_hash = ""
+trust_period = ""
+[consensus]
+timeout_commit = "1s"
+[instrumentation]
+prometheus = true
+''')
+        app = config / "app.toml"
+        app.write_text('''minimum-gas-prices = ""
+iavl-disable-fastnode = false
+[api]
+enable = true
+[grpc]
+enable = true
+[grpc-web]
+enable = true
+[json-rpc]
+enable = true
+[memiavl]
+enable = false
+snapshot-interval = 1
+[versiondb]
+enable = true
+[state-sync]
+snapshot-interval = 1
+''')
+        plan = {"kind": "native", "trust_height": 99, "trust_hash": "AB" * 32, "hours": 144}
+        peer = b"f" * 40 + b"@127.0.0.1:26656"
+        with patch.object(helper, "read_url", return_value=peer), patch.object(helper, "rpc", return_value={"peers": []}):
+            helper.configure(self.root, plan, 36656)
+        conf = tomllib.loads(comet.read_text())
+        self.assertEqual(conf["statesync"], {
+            "enable": False, "rpc_servers": ",".join(helper.RPCS), "trust_height": 99,
+            "trust_hash": "AB" * 32, "trust_period": "144h"})
+        self.assertEqual(conf["rpc"]["laddr"], "tcp://127.0.0.1:36657")
+        self.assertIs(tomllib.loads(app.read_text())["memiavl"]["enable"], True)
+
+    def write_store_roots(self, home):
         fixture=SCRIPT.with_name("fixtures")/"app-hash.json"
         record=json.loads(fixture.read_text()); height=record["height"]
         raw=field(1,height)
         for name,root in record["store_roots"].items():
             raw+=field(2,field(1,name.encode())+field(2,field(1,height)+field(2,bytes.fromhex(root))))
-        mem=self.root/"data/memiavl.db"; snap=mem/f"snapshot-{height:020}"
+        mem=home/"data/memiavl.db"; snap=mem/f"snapshot-{height:020}"
         snap.mkdir(parents=True); (mem/"current").symlink_to(snap.name)
         (snap/"__metadata").write_bytes(field(1,raw))
+        return record
+
+    def test_app_hash_from_mainnet_store_roots(self):
+        record = self.write_store_roots(self.root)
+        height = record["height"]
         helper.check_memiavl(self.root,height,record["app_hash"])
         with self.assertRaisesRegex(ValueError,"AppHash"):
             helper.check_memiavl(self.root,height,"00"*32)
+
+    def test_native_app_hash_mismatch_keeps_phase_unrestored(self):
+        record = self.write_store_roots(self.root / "node")
+        plan = {"chunks": 1, "app_hash": "00" * 32}
+        run = bash('job=$1; node="$job/node"; height=$2; plan=$3; phase=loaded; daemon=(true); native_restore',
+                   self.root, record["height"], json.dumps(plan))
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("restored AppHash mismatch", run.stderr)
+        self.assertEqual((self.root / "phase").read_text(), "restoring\n")
 
     def archive(self):
         file=self.root/"fixture.tar.lz4"
@@ -175,6 +261,16 @@ download'''
         self.assertNotEqual(p.returncode,0)
         self.assertFalse(archive.exists())
         self.assertEqual(len(list(self.root.glob("archive.part.rejected.*"))),1)
+
+    def test_cached_archive_of_expected_size_still_needs_its_digest(self):
+        archive = self.root / "archive"
+        archive.write_bytes(b"invalid")
+        plan = {"bytes": 7, "sha256": hashlib.sha256(b"correct").hexdigest(), "url": "https://example.org/fixture"}
+        run = bash('job=$1; archive="$job/archive"; plan=$2; curl() { return 7; }; download',
+                   self.root, json.dumps(plan))
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("Cached archive SHA-256 mismatch", run.stderr)
+        self.assertFalse((self.root / "phase").exists())
 
     def test_replay_pre_first_block_only(self):
         node=self.root/"node"

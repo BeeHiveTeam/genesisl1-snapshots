@@ -250,15 +250,18 @@ recover_checkpoint() {
 }
 
 follow() {
-    local pid rpc_url stat current caught ancestor after snapshot_seen=0 verified=0 rc=0
+    local pid rpc_url stat current caught ancestor after verified_file snapshot_seen=0 verified=0 rc=0
     rpc_url="http://127.0.0.1:$((port+1))"
+    # The snapshot proof belongs to the pinned job. The head must be verified on every run.
+    rm -f -- "$job/verified-height"
     if [[ -e "$job/replay-pending" ]]; then recover_checkpoint || die "Could not finish checkpoint recovery"; fi
     if [[ -f "$job/snapshot-proof" && $(cat -- "$job/snapshot-proof") == "$(field app_hash)" ]]; then snapshot_seen=1; fi
     support ports "$port"
     "${daemon[@]}" start --home "$node" --log_level warn >>"$job/node.log" 2>&1 &
     pid=$!
     trap 'kill -TERM "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
-    trap 'exit 130' INT TERM
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     printf 'Following mainnet. Local RPC %s  •  Node log %s/node.log\n' "$rpc_url" "$job"
     while kill -0 "$pid" 2>/dev/null; do
         if stat=$(curl --noproxy '*' -fsS --max-time 3 "$rpc_url/status" 2>/dev/null) &&
@@ -276,9 +279,11 @@ follow() {
             if [[ $caught == false ]] && (( snapshot_seen && ! verified )); then
                 ancestor=$((current-1))
                 if support head-verify "$rpc_url" "$ancestor"; then
-                    printf 'Caught up to GenesisL1 at height %s. The node will continue running.\n' "$current"
+                    verified_file=$(mktemp -- "$job/verified-height.XXXXXXXX")
+                    printf '%s\n' "$current" >"$verified_file"
+                    mv -T -- "$verified_file" "$job/verified-height"
                     verified=1
-                    printf '%s\n' "$current" >"$job/verified-height"
+                    printf 'Caught up to GenesisL1 at height %s. The node will continue running.\n' "$current"
                 else
                     rc=$?
                     (( rc == 75 )) || die "Witness verification failed; the new node has been stopped"
@@ -293,7 +298,10 @@ follow() {
     trap - EXIT INT TERM
     if (( rc )); then
         if recover_checkpoint; then follow; return; fi
-        tail -n 12 -- "$job/node.log" >&2
+        tail -n 12 -- "$job/node.log" >&2 || true
+    elif (( ! verified )); then
+        printf 'BeeHive: The node exited before mainnet catch-up was verified. See %s/node.log and rerun with the same --target to resume.\n' "$job" >&2
+        return 1
     fi
     return "$rc"
 }

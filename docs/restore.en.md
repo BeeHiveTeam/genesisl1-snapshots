@@ -33,4 +33,6 @@ Repeat the same command with the same target after an interruption. The script o
 
 The restore script checks the checkpoint and final block against the CometBFT RPCs at `https://26657.genesisl1.org` and `https://rpc.genesisl1.firsttensor.com`. The producer uses the same first witness and anode.team as its second witness at publication.
 
+Each time the receiver starts, the script clears the previous `verified-height` in the target directory. Once the receiver reports that it has caught up at height H and both witnesses confirm the block at H−1, the script records H in that file and keeps the node running. If the node exits normally before this check succeeds, the script returns exit code 1. Read `node.log` in the same directory and repeat the command to resume.
+
 The downloadable Bash script includes its Python helper and can run by itself. To change the client, edit `restore/client.sh.in` or `restore/helper.py` and regenerate the script and its checksum with `python3 restore/build_client.py`. CI checks that both generated files match their sources.
