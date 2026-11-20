@@ -36,6 +36,7 @@ class SourceHttpTest(unittest.TestCase):
                 response.url = request.full_url
                 return response
             urllib.request.urlopen = open_fixture
+            urllib.request.OpenerDirector.open = lambda self, req, timeout: open_fixture(req, timeout)
         """
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "sitecustomize.py").write_text(textwrap.dedent(fixture))

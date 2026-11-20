@@ -141,21 +141,30 @@ prepare_home() {
 }
 
 download() {
-    local bytes url hash part protocol current
-    bytes=$(field bytes); url=$(field url); hash=$(field sha256)
+    local bytes url hash part current attempt attempts=1
+    local -a transport
+    bytes=$(field bytes); hash=$(field sha256)
     part="$archive.part"
-    protocol='=https'
-    [[ $url != http://85.122.195.176:31246/data_13985500.tar.lz4 ]] || protocol='=http,https'
     if [[ ! -f $archive ]]; then
-        current=0; [[ ! -f $part ]] || current=$(stat -c %s -- "$part")
-        (( current <= bytes )) || die "The partial download is longer than the pinned archive"
-        if (( current < bytes )); then
+        [[ $(jq -r '.id // ""' <<<"$plan") != lcserve ]] || attempts=2
+        for ((attempt=1; attempt<=attempts; attempt++)); do
+            current=0; [[ ! -f $part ]] || current=$(stat -c %s -- "$part")
+            (( current <= bytes )) || die "The partial download is longer than the pinned archive"
+            (( current < bytes )) || break
+            if (( attempt > 1 )); then printf 'Checking LCserve again for the same archive.\n' >&2; fi
+            url=$(support download-url "$plan") || continue
+            transport=(--proto '=https' --proto-redir '=https')
+            if [[ $url == http://* ]]; then
+                # The helper verified the endpoint from the HTTPS catalog and the pinned archive identity.
+                transport=(--proto '=http' --max-redirs 0)
+            fi
             printf 'Downloading %s, starting at byte %s of %s.\n' "$(field file)" "$current" "$bytes"
-            curl --user-agent "$sync_user_agent" --fail --location --show-error --progress-bar --proto "$protocol" --proto-redir '=https' \
-                --connect-timeout 15 --speed-limit 1024 --speed-time 180 --retry 3 \
-                --max-filesize "$bytes" --continue-at - --output "$part" "$url"
-        fi
-        [[ $(stat -c %s -- "$part") == "$bytes" ]] || die "Incomplete download. Run the same command to resume."
+            if curl --user-agent "$sync_user_agent" --fail --location --show-error --progress-bar "${transport[@]}" \
+                    --connect-timeout 15 --speed-limit 1024 --speed-time 180 --retry 3 \
+                    --max-filesize "$bytes" --continue-at - --output "$part" -- "$url" &&
+                    [[ -f $part && $(stat -c %s -- "$part") == "$bytes" ]]; then break; fi
+        done
+        [[ -f $part && $(stat -c %s -- "$part") == "$bytes" ]] || die "Incomplete download. Run the same command to resume."
         if ! check_sha "$part" "$hash"; then
             mv -T -- "$part" "$part.rejected.$(date +%s)"
             die "Archive SHA-256 mismatch. Rejected data was set aside; run again after checking the source."

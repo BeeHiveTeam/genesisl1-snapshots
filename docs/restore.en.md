@@ -31,6 +31,12 @@ bash restore/beehive-sync.sh --source beehive-native \
 
 Repeat the same command with the same target after an interruption. The script operates on a separate node home with its own keys and ports. Check that the receiver matches witnesses and catches up to the changing mainnet head. The Native checkpoint must have more than one hour of trust remaining for a new plan. Other source choices and the interactive `auto` option are described by `bash restore/beehive-sync.sh --help`. [Current Native manifest](https://l1-snapshots.bee-hive.work:8545/native/latest.json)
 
+### Downloading from LCserve
+
+Use `--source lcserve` to choose LCserve. The client reads the current storage address and port from the operator’s HTTPS catalog. If a download breaks, it checks the catalog again and resumes from the bytes already saved. You can also restart it with the same `--target`. If the catalog and mirror both stop offering the exact file, the client keeps the partial download and stops. To choose another snapshot, use a new target. [LCserve catalog](https://lcserve.zip/)
+
+The saved plan pins the filename, height, byte count and SHA-256. A new snapshot advertised over HTTP needs matching metadata from the independent HTTPS mirror or a checksum already pinned in the client. The client verifies the entire archive before extraction.
+
 The restore script checks the checkpoint and final block against the CometBFT RPCs at `https://26657.genesisl1.org` and `https://rpc.genesisl1.firsttensor.com`. The producer uses the same first witness and anode.team as its second witness at publication.
 
 Each time the receiver starts, the script clears the previous `verified-height` in the target directory. Once the receiver reports that it has caught up at height H and both witnesses confirm the block at H−1, the script records H in that file and keeps the node running. If the node exits normally before this check succeeds, the script returns exit code 1. Read `node.log` in the same directory and repeat the command to resume.

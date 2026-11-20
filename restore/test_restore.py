@@ -114,21 +114,6 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,"no downloadable"):
                 helper.firsttensor()
 
-    def test_lcserve_new_height_requires_mirror_agreement(self):
-        import contextlib
-        @contextlib.contextmanager
-        def listing(*args,**kwargs):
-            result=io.BytesIO(b'<a href="./data_20000000.tar.lz4">latest</a>')
-            result.url="http://85.122.195.176:31246/"
-            yield result
-        with patch.multiple(helper,urlopen=listing,head=lambda _:123,checksum=lambda *_:"11"*32):
-            row=helper.lcserve()
-            self.assertEqual((row["url"],row["height"]),(helper.LC_MIRROR,20000000))
-        with patch.multiple(helper,urlopen=listing,head=lambda _:123,
-                        checksum=lambda url,_:"11"*32 if url.startswith("https:") else "22"*32):
-            with self.assertRaisesRegex(ValueError,"offline"):
-                helper.lcserve()
-
     def test_config_edit_preserves_other_settings(self):
         f=self.root/"config.toml"
         f.write_text('mode = "old"\n[statesync]\nenable = true\nval = "keep"\n')

@@ -23,6 +23,7 @@ import concurrent.futures
 import datetime as dt
 import hashlib
 from html.parser import HTMLParser
+from http.client import HTTPException
 import ipaddress
 import json
 import os
@@ -36,13 +37,13 @@ import tarfile
 import time
 import tomllib
 from urllib.parse import urljoin, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 CHAIN = "genesis_29-2"
 BASE = "https://l1-snapshots.bee-hive.work:8545/"
 RPCS = ("https://26657.genesisl1.org", "https://rpc.genesisl1.firsttensor.com")
-LC_FILE = "data_13985500.tar.lz4"
-LC_URL = "http://85.122.195.176:31246/" + LC_FILE
+LC_HEIGHT = 13985500
+LC_CATALOG = "https://lcserve.zip/"
 LC_BYTES = 701371435944
 LC_SHA = "24aaaf3bfdce38eef451503386457bbe15c5892a9227644510858d034e2aff8b"
 LC_MIRROR = "https://ftp.basementnodes.ca/snapshots/gl1/data.tar.lz4"
@@ -147,46 +148,112 @@ def firsttensor():
     raise ValueError("no downloadable snapshot manifest in FirstTensor's service list; RPC/gRPC available")
 
 
-def checksum(url, filename):
-    cols=read_url(url+".sha256",1024).decode("ascii").strip().split()
-    require(len(cols)==2 and cols[1].lstrip("*")==filename,"unexpected checksum filename")
-    return digest(cols[0]).lower()
+class LCServeRedirects(HTTPRedirectHandler):
+    def __init__(self, directory):
+        self.directory = directory
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urlsplit(newurl)
+        require(urlsplit(req.full_url).scheme == "https", "redirect from an HTTP storage endpoint")
+        require(target.hostname and target.username is None and target.password is None and not target.fragment,
+                "invalid LCserve redirect")
+        if target.scheme == "http":
+            require(self.directory, "HTTPS archive metadata downgrade")
+            provider_url(req.full_url, "lcserve")
+            ip = ipaddress.ip_address(target.hostname)
+            require(ip.is_global and not ip.is_multicast and not ip.is_reserved and
+                    target.port is not None and 25000 <= target.port <= 64000, "invalid LCserve storage endpoint")
+        elif self.directory:
+            provider_url(newurl, "lcserve")
+        else:
+            require(target.scheme == "https", "HTTPS archive metadata required")
+        redirect = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if req.get_method() == "HEAD":
+            redirect.method = "HEAD"
+        return redirect
 
 
-def lcserve():
-    # A legacy HTTP listing can name a candidate. Authenticate new files against the project's HTTPS mirror.
+def lcserve_read(url, method="GET", *, directory=False):
+    opener = build_opener(LCServeRedirects(directory))
+    return opener.open(Request(url, method=method, headers=HTTP_HEADERS), timeout=10)
+
+
+def lcserve_listing():
+    with lcserve_read(LC_CATALOG, directory=True) as response:
+        base = response.url
+        page = response.read(256 * 1024 + 1)
+    require(len(page) <= 256 * 1024, "LCserve listing too large")
+    parser = Links()
+    parser.feed(page.decode("utf-8", errors="replace"))
+    heights = {int(m[1]) for href in parser.links
+               if (m := re.fullmatch(r"(?:\./)?data_([1-9]\d{0,11})\.tar\.lz4", href))}
+    require(heights, "no snapshots listed by LCserve")
+    return base, heights
+
+
+def lcserve_metadata(url, filename):
+    with lcserve_read(url, "HEAD") as response:
+        size = int(response.headers.get("Content-Length", "0"))
+    require(0 < size <= 8 * 1024**4, "invalid LCserve archive size")
+    with lcserve_read(url + ".sha256") as response:
+        body = response.read(1025)
+    require(len(body) <= 1024, "LCserve checksum file too large")
+    fields = body.decode("ascii").split()
+    require(len(fields) == 2 and fields[1].removeprefix("*") == filename, "unexpected checksum filename")
+    return size, digest(fields[0]).lower()
+
+
+def lcserve(pinned=None):
+    # A saved plan or this previously verified release can authenticate direct HTTP storage.
+    height = pinned["height"] if pinned else LC_HEIGHT
+    expected = (pinned["bytes"], pinned["sha256"]) if pinned else (LC_BYTES, LC_SHA)
+    filename = f"data_{height}.tar.lz4"
+    if pinned:
+        require(pinned["kind"] == "full" and pinned["file"] == filename and
+                type(height) is int and 0 < height < 10**12, "invalid pinned LCserve archive")
+
+    def row(h, name, url, size, sha):
+        return dict(id="lcserve", kind="full", file=name, url=url, bytes=size, height=h,
+                    sha256=sha, app_hash="", block_hash="", lcserve_catalog=True)
+
+    errors = (OSError, ValueError, KeyError, HTTPException)
     try:
-        with urlopen("https://lcserve.zip",timeout=10) as r:
-            base=r.url
-            text=r.read(256*1024+1)
-        require(len(text)<=256*1024,"LCserve listing too large")
-        parser=Links(); parser.feed(text.decode("utf-8",errors="replace"))
-        heights=[int(m[1]) for href in parser.links if (m:=re.fullmatch(r"(?:\./)?data_(\d{1,12})\.tar\.lz4",href))]
-        if heights:
-            h=max(heights); name=f"data_{h}.tar.lz4"; url=urljoin(base,name)
-            require(url.startswith("https:") or url.startswith(LC_URL.rsplit("/",1)[0]+"/"),"unknown HTTP snapshot origin")
-            size=head(url); sha=checksum(url,name)
-            require(0<size<=8*1024**4,"invalid LCserve archive size")
-            if not url.startswith("https:"):
-                if head(LC_MIRROR)==size and checksum(LC_MIRROR,"data.tar.lz4")==sha:
-                    url=LC_MIRROR
-                else:
-                    require((name,size,sha)==(LC_FILE,LC_BYTES,LC_SHA),"no independent checksum for this HTTP archive")
-            return dict(id="lcserve",kind="full",file=name,url=url,bytes=size,height=h,sha256=sha,app_hash="",block_hash="")
-    except (OSError,KeyError,ValueError):
-        pass
-    # This earlier LCserve release was restored; only reuse the exact pinned artifact.
-    for url in (LC_URL, LC_MIRROR):
+        base, available = lcserve_listing()
+    except errors:
+        base, available = "", set()
+    candidates = [height] if pinned or not available else list(dict.fromkeys((max(available), height)))
+    for h in candidates:
+        if h not in available:
+            continue
+        name = f"data_{h}.tar.lz4"
+        url = urljoin(base, name)
         try:
-            if head(url) != LC_BYTES:
-                continue
-            if url == LC_URL and checksum(url,LC_FILE) != LC_SHA:
-                continue
-            return dict(id="lcserve", kind="full", file=LC_FILE, url=url, bytes=LC_BYTES, height=13985500,
-                        sha256=LC_SHA, app_hash="", block_hash="")
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
-    raise ValueError("known LCserve archive is offline or its mirror has moved to a different snapshot")
+            size, sha = lcserve_metadata(url, name)
+            if h == height:
+                require((size, sha) == expected, "LCserve snapshot differs from its pin")
+            elif urlsplit(url).scheme == "http":
+                require(lcserve_metadata(LC_MIRROR, "data.tar.lz4") == (size, sha),
+                        "no independent checksum for this HTTP archive")
+                url = LC_MIRROR
+            return row(h, name, url, size, sha)
+        except errors:
+            continue
+    try:
+        if lcserve_metadata(LC_MIRROR, "data.tar.lz4") == expected:
+            return row(height, filename, LC_MIRROR, *expected)
+    except errors:
+        pass
+    raise ValueError("LCserve archive is offline or does not match the trusted size and SHA-256")
+
+
+def download_url(plan):
+    url = plan["url"]
+    scheme = urlsplit(url).scheme
+    # Older plans stored only the original HTTP address or the official mirror URL.
+    if plan.get("id") == "lcserve" and plan.get("lcserve_catalog", scheme == "http" or url == LC_MIRROR):
+        return lcserve(pinned=plan)["url"]
+    require(scheme == "https" and urlsplit(url).hostname, "HTTPS archive URL required")
+    return url
 
 
 def catalogue(custom_source, custom_url):
@@ -480,6 +547,7 @@ def verify_head(local, height):
 def main():
     action, *args = sys.argv[1:]
     if action=="catalog": print(json.dumps(catalogue(*args)))
+    elif action=="download-url": print(download_url(json.loads(args[0])))
     elif action=="inspect": inspect(Path(args[0]))
     elif action=="target": check_target(Path(args[0]),Path(args[1]).resolve())
     elif action=="anchor": print(json.dumps(anchor(json.loads(args[0]))))
@@ -634,21 +702,30 @@ prepare_home() {
 }
 
 download() {
-    local bytes url hash part protocol current
-    bytes=$(field bytes); url=$(field url); hash=$(field sha256)
+    local bytes url hash part current attempt attempts=1
+    local -a transport
+    bytes=$(field bytes); hash=$(field sha256)
     part="$archive.part"
-    protocol='=https'
-    [[ $url != http://85.122.195.176:31246/data_13985500.tar.lz4 ]] || protocol='=http,https'
     if [[ ! -f $archive ]]; then
-        current=0; [[ ! -f $part ]] || current=$(stat -c %s -- "$part")
-        (( current <= bytes )) || die "The partial download is longer than the pinned archive"
-        if (( current < bytes )); then
+        [[ $(jq -r '.id // ""' <<<"$plan") != lcserve ]] || attempts=2
+        for ((attempt=1; attempt<=attempts; attempt++)); do
+            current=0; [[ ! -f $part ]] || current=$(stat -c %s -- "$part")
+            (( current <= bytes )) || die "The partial download is longer than the pinned archive"
+            (( current < bytes )) || break
+            if (( attempt > 1 )); then printf 'Checking LCserve again for the same archive.\n' >&2; fi
+            url=$(support download-url "$plan") || continue
+            transport=(--proto '=https' --proto-redir '=https')
+            if [[ $url == http://* ]]; then
+                # The helper verified the endpoint from the HTTPS catalog and the pinned archive identity.
+                transport=(--proto '=http' --max-redirs 0)
+            fi
             printf 'Downloading %s, starting at byte %s of %s.\n' "$(field file)" "$current" "$bytes"
-            curl --user-agent "$sync_user_agent" --fail --location --show-error --progress-bar --proto "$protocol" --proto-redir '=https' \
-                --connect-timeout 15 --speed-limit 1024 --speed-time 180 --retry 3 \
-                --max-filesize "$bytes" --continue-at - --output "$part" "$url"
-        fi
-        [[ $(stat -c %s -- "$part") == "$bytes" ]] || die "Incomplete download. Run the same command to resume."
+            if curl --user-agent "$sync_user_agent" --fail --location --show-error --progress-bar "${transport[@]}" \
+                    --connect-timeout 15 --speed-limit 1024 --speed-time 180 --retry 3 \
+                    --max-filesize "$bytes" --continue-at - --output "$part" -- "$url" &&
+                    [[ -f $part && $(stat -c %s -- "$part") == "$bytes" ]]; then break; fi
+        done
+        [[ -f $part && $(stat -c %s -- "$part") == "$bytes" ]] || die "Incomplete download. Run the same command to resume."
         if ! check_sha "$part" "$hash"; then
             mv -T -- "$part" "$part.rejected.$(date +%s)"
             die "Archive SHA-256 mismatch. Rejected data was set aside; run again after checking the source."
