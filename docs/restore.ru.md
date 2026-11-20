@@ -30,3 +30,5 @@ bash restore/beehive-sync.sh --source beehive-native \
 ```
 
 После обрыва повторите ту же команду с тем же `--target`. Скрипт использует отдельную ноду со своими ключами и портами. Проверьте сверку с независимыми RPC и догон текущей высоты mainnet. При создании нового плана до конца доверия контрольной точки должно оставаться больше часа. Другие источники и интерактивный выбор `auto` описаны в `bash restore/beehive-sync.sh --help`. [Актуальный манифест Native](https://l1-snapshots.bee-hive.work:8545/native/latest.json)
+
+При восстановлении скрипт сверяет контрольную точку и итоговый блок с CometBFT RPC `https://26657.genesisl1.org` и `https://rpc.genesisl1.firsttensor.com`. При публикации первый свидетель тот же, второй предоставляет anode.team.

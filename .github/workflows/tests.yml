@@ -1,0 +1,34 @@
+name: Snapshot tests
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Verify source checksums and shell syntax
+        run: |
+          sha256sum --strict -c SHA256SUMS
+          (cd restore && sha256sum --strict -c beehive-sync.sh.sha256)
+          for script in producer/*.sh restore/*.sh; do bash -n "$script"; done
+      - name: Test the restore client and stock SDK import
+        run: |
+          python3 -B -m unittest discover -v -s restore -p 'test_*.py'
+          source restore/beehive-sync.sh
+          job=$(mktemp -d "$RUNNER_TEMP/genesis-sdk.XXXXXXXX")
+          bin_arg=
+          get_binary
+          GENESISD_TEST="$binary" python3 -B -m unittest discover -v -s producer -p 'test_*.py'
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: producer/exporter/go.mod
+          cache-dependency-path: producer/exporter/go.sum
+      - name: Test and build the exporter with the pinned IAVL patch
+        env:
+          GOTOOLCHAIN: local
+        run: bash producer/build-exporter.sh "$RUNNER_TEMP/native-export"

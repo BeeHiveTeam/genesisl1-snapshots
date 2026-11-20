@@ -95,6 +95,7 @@ def freeze(source: Path, frozen: Path):
                 out.flush()
                 os.fsync(out.fileno())
         (frozen / "LOCK").touch(mode=0o600, exist_ok=True)
-        return {"table_count": len(tables), "wal_count": sum(bool(WAL.fullmatch(n)) for n in metadata),
+        return {"table_count": len(tables), "table_bytes": sum((frozen / name).stat().st_size for name in tables),
+                "wal_count": sum(bool(WAL.fullmatch(n)) for n in metadata),
                 "manifest": next(n for n in metadata if MANIFEST.fullmatch(n))}
     raise RuntimeError("No stable LevelDB capture window; retry at the next timer tick")

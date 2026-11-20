@@ -8,8 +8,9 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import archive
 import producer as p
@@ -82,6 +83,64 @@ class ProducerTest(unittest.TestCase):
             self.assertFalse(self.c.latest.exists())
             self.assertFalse((self.c.public/p.filename(100)).exists())
 
+    def test_build_space_tracks_previous_export_and_table_growth(self):
+        c = self.c
+        c.db.mkdir(parents=True)
+        (c.db / "1.ldb").write_bytes(b"x" * 600)
+        (c.db / "2.sst").write_bytes(b"x" * 200)
+        (c.db / "3.log").write_bytes(b"ignored")
+        for manifest, expected in ((None, 1000), ({"bytes": 240}, 300),
+                                   ({"bytes": 220, "compressed_chunk_bytes": 200, "source_table_bytes": 400}, 500),
+                                   ({"bytes": 220, "compressed_chunk_bytes": 200, "source_table_bytes": 1600}, 250)):
+            with self.subTest(manifest=manifest), patch.object(c, "space") as space:
+                p.check_build_space(c, manifest)
+                space.assert_called_once_with(c.work, 2 * expected)
+        with patch.object(c, "space") as space, patch.object(Path, "stat", autospec=True,
+                side_effect=lambda path: SimpleNamespace(st_dev=1 if path == c.work else 2)):
+            p.check_build_space(c, {"bytes": 240})
+            self.assertEqual(space.call_args_list, [call(c.work, 300), call(c.public, 300)])
+
+    def test_publish_rejects_insufficient_room_before_opening_large_archive(self):
+        c = self.c
+        previous = {"chain_id": p.CHAIN, "snapshot_format": 3, "snapshot_height": 80,
+                    "file": p.filename(80), "bytes": 3}
+        p.put(c.latest, previous)
+        (c.public / p.filename(80)).write_bytes(b"old")
+        original = Path.lstat
+        def large_chunk(path):
+            info = original(path)
+            if path == self.files / "0":
+                return SimpleNamespace(st_mode=info.st_mode, st_size=80 * p.GIB)
+            return info
+        with patch.object(p, "agree", return_value=self.proof), patch.object(Path, "lstat", large_chunk), \
+             patch.object(shutil, "disk_usage", return_value=SimpleNamespace(free=c.reserve + 65 * p.GIB)), \
+             patch.object(tarfile, "open") as open_archive:
+            with self.assertRaisesRegex(ValueError, "Insufficient space"):
+                p.publish(c)
+            open_archive.assert_not_called()
+        self.assertEqual(p.read(c.latest), previous)
+        self.assertFalse((c.public / ".beehive-native-stage/archive.partial").exists())
+        self.assertFalse(c.rebuild.exists())
+
+    def test_archive_estimate_covers_every_tar_member_and_stale_partial_is_removed(self):
+        c = self.c
+        stage = c.public / ".beehive-native-stage"
+        stage.mkdir()
+        partial = stage / "archive.partial"
+        partial.write_bytes(b"old attempt")
+        requested = []
+        def check_space(path, size=0):
+            if size:
+                self.assertFalse(partial.exists())
+                requested.append(size)
+        with patch.object(p, "agree", return_value=self.proof), patch.object(c, "space", side_effect=check_space):
+            p.publish(c)
+        actual = (c.public / p.filename(100)).stat().st_size
+        members = [(self.dest / "snapshot.pb").stat().st_size, *(len(d) for d in self.chunks)]
+        self.assertEqual(requested, [archive.archive_space(members)])
+        self.assertGreater(requested[0], actual)
+        self.assertGreater(archive.archive_space([1] * 1000), archive.archive_space([1000]))
+
     def test_real_sdk_import(self):
         binary = os.getenv("GENESISD_TEST")
         if not binary:
@@ -103,6 +162,7 @@ class ProducerTest(unittest.TestCase):
             (src/name).write_bytes(data)
         stats=freeze(src,target)
         self.assertEqual(stats["table_count"],1)
+        self.assertEqual(stats["table_bytes"],len(b"table"))
         self.assertEqual((src/"3.ldb").stat().st_ino,(target/"3.ldb").stat().st_ino)
         self.assertNotEqual((src/"2.log").stat().st_ino,(target/"2.log").stat().st_ino)
         (src/"2.log").write_bytes(b"changed")

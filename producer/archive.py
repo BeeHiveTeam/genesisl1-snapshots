@@ -79,11 +79,30 @@ class HashedChunk:
         return data
 
 
-def package(snapshot, output_dir: Path, destination: Path, report):
+def archive_space(member_sizes):
+    # USTAR headers and padding, two end blocks, then tarfile's final record.
+    block = tarfile.BLOCKSIZE
+    total = 2 * block
+    for size in member_sizes:
+        total += block + ((size + block - 1) // block) * block
+    record = tarfile.RECORDSIZE
+    total = ((total + record - 1) // record) * record
+    # Stored DEFLATE blocks and space for the manifest/checksum and filesystem rounding.
+    return total + (total + 99) // 100 + 1024**2
+
+
+def package(snapshot, output_dir: Path, destination: Path, report, *, check_space=None):
     meta, hashes, expected = sdk_metadata(snapshot)
     check_input((output_dir / "snapshot.pb").read_bytes() == meta, "SDK protobuf and exporter report disagree")
     chunk_dir = output_dir / str(snapshot["height"]) / "3"
     check_input({str(i) for i in range(len(hashes))} == set(os.listdir(chunk_dir)), "Incomplete SDK chunk directory")
+    sizes = []
+    for index in range(len(hashes)):
+        info = (chunk_dir / str(index)).lstat()
+        check_input(stat.S_ISREG(info.st_mode) and info.st_size > 0, "Invalid chunk file")
+        sizes.append(info.st_size)
+    if check_space is not None:
+        check_space(archive_space([len(meta), *sizes]))
     payload_bytes, combined = 0, hashlib.sha256()
     with destination.open("xb") as raw:
         writer = HashedOutput(raw)
@@ -96,7 +115,8 @@ def package(snapshot, output_dir: Path, destination: Path, report):
                     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
                     with os.fdopen(descriptor, "rb") as stream:
                         info = os.fstat(descriptor)
-                        check_input(stat.S_ISREG(info.st_mode) and info.st_size > 0, "Invalid chunk file")
+                        check_input(stat.S_ISREG(info.st_mode) and info.st_size == sizes[index],
+                                    "Chunk changed since the space check")
                         reader = HashedChunk(stream, combined)
                         archive.addfile(header(str(index), info.st_size), reader)
                         check_input(reader.sha.digest() == expected_chunk, f"SDK chunk checksum mismatch at {index}")

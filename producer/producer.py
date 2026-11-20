@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 import archive
 from archive import require
-from capture import freeze
+from capture import TABLE, freeze
 from chain import CHAIN, VERSION, WITNESSES, agree, now, parse_time, replica
 
 GIB = 1024**3
@@ -97,7 +97,9 @@ class Config:
         self.rebuild = self.public / ".beehive-native-rebuild.json"
 
     def space(self, path, additional=0):
-        require(shutil.disk_usage(path).free >= self.reserve + additional, "Disk reserve reached at " + str(path))
+        free = shutil.disk_usage(path).free
+        needed = self.reserve + additional
+        require(free >= needed, f"Insufficient space at {path}: {free} bytes free, {needed} required including reserve")
 
     def latest_manifest(self):
         if not self.latest.exists():
@@ -120,6 +122,37 @@ class Config:
 def filename(height):
     require(type(height) is int and 0 < height < 2**53, "Invalid publication height")
     return f"genesis_29-2-native-{height}-format3.tar.gz"
+
+
+def check_build_space(c, latest):
+    # Live SSTs are immutable but compaction can unlink them during this estimate.
+    current = 0
+    with os.scandir(c.db) as entries:
+        for entry in entries:
+            if TABLE.fullmatch(entry.name):
+                try:
+                    current += entry.stat(follow_symlinks=False).st_size
+                except FileNotFoundError:
+                    continue
+    require(current > 0, "No LevelDB tables available for the space estimate")
+    estimate = current
+    if latest:
+        previous = latest.get("compressed_chunk_bytes") or latest["bytes"]
+        require(type(previous) is int and previous > 0, "Invalid previous snapshot size")
+        previous_tables = latest.get("source_table_bytes")
+        if previous_tables is None:
+            estimate = previous
+        else:
+            require(type(previous_tables) is int and previous_tables > 0, "Invalid previous source table size")
+            estimate = max(previous, (previous * current + previous_tables - 1) // previous_tables)
+    # Allow 25% growth. Chunks and the packaged archive coexist until publication.
+    budget = (5 * estimate + 3) // 4
+    if c.work.stat().st_dev == c.public.stat().st_dev:
+        c.space(c.work, 2 * budget)
+    else:
+        c.space(c.work, budget)
+        c.space(c.public, budget)
+    log("space_estimate", source_table_bytes=current, bytes_per_copy=budget)
 
 
 def sha(path):
@@ -249,7 +282,6 @@ def build(c):
             log("current", height=latest["snapshot_height"])
             return
         current = source_check(c)
-        c.space(c.work, 115 * GIB)
         c.job.mkdir(mode=0o750, exist_ok=True)
         c.job.chmod(0o750)
         frozen = c.job / "pin/application.db"
@@ -257,6 +289,12 @@ def build(c):
         if record.exists() and parse_time(read(record)["proof"]["fixed_trust_anchor"]["expires_at_utc"]) <= now()+timedelta(hours=48):
             discard(c, c.job)
             c.job.mkdir(mode=0o750)
+        dest, exportlog = c.job / "chunks", c.job / "export.jsonl"
+        result, snapshot = opened(exportlog) if record.is_file() else (None, None)
+        export_complete = bool(snapshot and (dest / "snapshot.pb").is_file())
+        if not export_complete:
+            discard(c, dest)
+            check_build_space(c, latest)
         if not record.exists():
             discard(c, c.job / "pin")
             capture = freeze(c.db, frozen)
@@ -273,10 +311,7 @@ def build(c):
             put(record, {"height": h, "app_hash": app, "capture": capture, "proof": proof})
         source = read(record)
         h = source["height"]
-        dest, exportlog = c.job / "chunks", c.job / "export.jsonl"
-        result, snapshot = opened(exportlog)
-        if not (snapshot and (dest / "snapshot.pb").is_file()):
-            discard(c, dest)
+        if not export_complete:
             log("exporting", height=h, app_hash=source["app_hash"], tables=source["capture"]["table_count"])
             with exportlog.open("w") as out:
                 export_monitored(c, frozen, dest, out)
@@ -292,7 +327,10 @@ def build(c):
         for chunk in (dest / str(h) / "3").iterdir():
             chunk.chmod(0o640)
         (dest / "snapshot.pb").chmod(0o640)
-        put(c.ready, {"proof": source["proof"], "snapshot": snapshot})
+        ready = {"proof": source["proof"], "snapshot": snapshot}
+        if "table_bytes" in source["capture"]:
+            ready["source_table_bytes"] = source["capture"]["table_bytes"]
+        put(c.ready, ready)
         discard(c, c.job / "pin")
         log("ready_to_publish", height=h, chunks=snapshot["chunks"])
 
@@ -331,7 +369,6 @@ def publish(c):
         if old and old["snapshot_height"] >= h:
             return
         proof = agree(h, app)
-        c.space(c.public, 65 * GIB)
         stage = c.public / ".beehive-native-stage"
         stage.mkdir(mode=0o700, exist_ok=True)
         require(stage.resolve() == stage and stage.stat().st_uid == os.getuid(), "Unsafe publication staging directory")
@@ -344,7 +381,8 @@ def publish(c):
 
         try:
             try:
-                details = archive.package(snap, c.job / "chunks", temp, progress)
+                details = archive.package(snap, c.job / "chunks", temp, progress,
+                                          check_space=lambda needed: c.space(c.public, needed))
             except (archive.SnapshotDataError, FileNotFoundError) as exc:
                 put(c.rebuild, {"height": h, "detected_at_utc": now().isoformat()}, 0o644)
                 raise RuntimeError("Fresh export requested after failed SDK input verification") from exc
@@ -366,6 +404,8 @@ def publish(c):
                                          "combined_chunk_hash_checked": True, "archive_sha256_read_back": True,
                                          "consensus_witnesses": list(WITNESSES),
                                          "full_restore_of_this_edition": "not tested by the automatic publisher"}}
+            if "source_table_bytes" in r:
+                manifest["source_table_bytes"] = r["source_table_bytes"]
             put(c.public / (name+".sha256"), details["sha256"]+"  "+name+"\n", 0o644)
             put(c.public / name.replace(".tar.gz", ".json"), manifest, 0o644)
             put(c.latest, manifest, 0o644)
@@ -384,8 +424,9 @@ def main():
     c = Config(args.config)
     if args.action == "check":
         status = source_check(c)
-        c.space(c.work, 115 * GIB)
-        log("preflight_passed", due=c.due(c.latest_manifest()), **status)
+        latest = c.latest_manifest()
+        check_build_space(c, latest)
+        log("preflight_passed", due=c.due(latest), **status)
         return
     if args.action in ("run", "build"):
         build(c)

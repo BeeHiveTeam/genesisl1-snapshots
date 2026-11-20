@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
+sync_user_agent='BeeHive-GenesisL1-Sync/1'
 
 banner() {
     cat <<'BEEHIVE'
@@ -15,7 +16,7 @@ BEEHIVE
 
 # TOML parsing and streaming tar validation use the Python standard library.
 support() {
-    python3 - "$@" <<'PYTHON'
+    BEEHIVE_SYNC_AGENT="$sync_user_agent" python3 - "$@" <<'PYTHON'
 import concurrent.futures
 import datetime as dt
 import hashlib
@@ -44,6 +45,7 @@ LC_BYTES = 701371435944
 LC_SHA = "24aaaf3bfdce38eef451503386457bbe15c5892a9227644510858d034e2aff8b"
 LC_MIRROR = "https://ftp.basementnodes.ca/snapshots/gl1/data.tar.lz4"
 GIB = 1024**3
+HTTP_HEADERS = {"User-Agent": os.environ["BEEHIVE_SYNC_AGENT"]}
 
 
 def require(ok, message):
@@ -52,7 +54,7 @@ def require(ok, message):
 
 
 def read_url(url, limit=4*1024**2):
-    with urlopen(Request(url, headers={"User-Agent": "BeeHive-GenesisL1-Sync/1"}), timeout=12) as r:
+    with urlopen(Request(url, headers=HTTP_HEADERS), timeout=12) as r:
         require(not url.startswith("https:") or r.url.startswith("https:"), "HTTPS downgrade")
         body = r.read(limit + 1)
         require(len(body) <= limit, "response exceeds metadata size limit")
@@ -64,7 +66,7 @@ def rpc(server, method):
 
 
 def head(url):
-    with urlopen(Request(url, method="HEAD"), timeout=10) as r:
+    with urlopen(Request(url, method="HEAD", headers=HTTP_HEADERS), timeout=10) as r:
         require(not url.startswith("https:") or r.url.startswith("https:"), "HTTPS downgrade")
         return int(r.headers["Content-Length"])
 
@@ -541,7 +543,7 @@ check_sha() {
     [[ ${sum%% *} == "$2" ]]
 }
 https_get() {
-    curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
+    curl --user-agent "$sync_user_agent" --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
         --connect-timeout 12 --max-time 180 --max-filesize "$3" --output "$2" "$1"
 }
 show_sources() {
@@ -634,7 +636,7 @@ download() {
         (( current <= bytes )) || die "The partial download is longer than the pinned archive"
         if (( current < bytes )); then
             printf 'Downloading %s, starting at byte %s of %s.\n' "$(field file)" "$current" "$bytes"
-            curl --fail --location --show-error --progress-bar --proto "$protocol" --proto-redir '=https' \
+            curl --user-agent "$sync_user_agent" --fail --location --show-error --progress-bar --proto "$protocol" --proto-redir '=https' \
                 --connect-timeout 15 --speed-limit 1024 --speed-time 180 --retry 3 \
                 --max-filesize "$bytes" --continue-at - --output "$part" "$url"
         fi
