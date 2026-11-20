@@ -1,0 +1,11 @@
+[Unit]
+Description=Check hourly whether a new GenesisL1 Native checkpoint is due
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=1min
+Unit=genesisl1-native-producer.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+# Keep chain data, snapshots, node homes, private work trees and built executables local.
+*.tar
+*.tar.gz
+*.tar.lz4
+*.tar.zst
+*.ldb
+*.sst
+*.db/
+/bin/
+/native-work/
+/native-output/
+**/current-build/
+**/.beehive-native-stage/
+**/priv_validator_key.json
+**/node_key.json
+**/keyring-*/
+**/__pycache__/

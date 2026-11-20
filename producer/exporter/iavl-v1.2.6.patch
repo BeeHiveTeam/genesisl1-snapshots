@@ -1,0 +1,227 @@
+--- a/export.go
++++ b/export.go
+@@ -34,6 +34,7 @@
+ 	tree   *ImmutableTree
+ 	ch     chan *ExportNode
+ 	cancel context.CancelFunc
++	err    error
+ }
+ 
+ // NewExporter creates a new Exporter. Callers must call Close() when done.
+@@ -61,6 +62,11 @@
+ 
+ // export exports nodes
+ func (e *Exporter) export(ctx context.Context) {
++	defer close(e.ch)
++	if workers := configuredExportWorkers.Load(); workers > 1 {
++		e.err = e.exportParallel(ctx, int(workers))
++		return
++	}
+ 	e.tree.root.traversePost(e.tree, true, func(node *Node) bool {
+ 		exportNode := &ExportNode{
+ 			Key:     node.key,
+@@ -76,13 +82,15 @@
+ 			return true
+ 		}
+ 	})
+-	close(e.ch)
+ }
+ 
+ // Next fetches the next exported node, or returns ExportDone when done.
+ func (e *Exporter) Next() (*ExportNode, error) {
+ 	if exportNode, ok := <-e.ch; ok {
+ 		return exportNode, nil
++	}
++	if e.err != nil {
++		return nil, e.err
+ 	}
+ 	return nil, ErrorExportDone
+ }
+--- /dev/null
++++ b/export_parallel.go
+@@ -0,0 +1,185 @@
++package iavl
++
++import (
++	"context"
++	"fmt"
++	"sync"
++	"sync/atomic"
++)
++
++// Enabled only by the standalone exporter on a frozen, read-only database.
++var configuredExportWorkers atomic.Int32
++
++const exportSubtreeLeaves = 2048
++
++func SetExportWorkers(workers int) error {
++	if workers < 1 || workers > 64 {
++		return fmt.Errorf("export workers must be between 1 and 64")
++	}
++	configuredExportWorkers.Store(int32(workers))
++	return nil
++}
++
++type exportFrame struct {
++	node *Node
++	emit bool
++}
++
++type exportResult struct {
++	node *ExportNode
++	err  error
++}
++
++type exportPart struct {
++	root    *Node
++	direct  bool
++	results chan exportResult
++}
++
++type exportCursor struct {
++	tree  *ImmutableTree
++	stack []exportFrame
++}
++
++// next lazily partitions the tree into bounded subtrees and their ancestors.
++// The resulting sequence retains the original depth-first post-order.
++func (cursor *exportCursor) next() (*exportPart, error) {
++	for len(cursor.stack) > 0 {
++		last := len(cursor.stack) - 1
++		frame := cursor.stack[last]
++		cursor.stack = cursor.stack[:last]
++		if frame.node == nil {
++			continue
++		}
++		if frame.emit {
++			return &exportPart{root: frame.node, direct: true}, nil
++		}
++		if frame.node.size <= exportSubtreeLeaves {
++			return &exportPart{root: frame.node, results: make(chan exportResult, 2*exportSubtreeLeaves)}, nil
++		}
++		left, err := frame.node.getLeftNode(cursor.tree)
++		if err != nil {
++			return nil, err
++		}
++		right, err := frame.node.getRightNode(cursor.tree)
++		if err != nil {
++			return nil, err
++		}
++		cursor.stack = append(cursor.stack,
++			exportFrame{node: frame.node, emit: true},
++			exportFrame{node: right}, exportFrame{node: left},
++		)
++	}
++	return nil, nil
++}
++
++func nodeForExport(node *Node) *ExportNode {
++	return &ExportNode{
++		Key: node.key, Value: node.value,
++		Version: node.nodeKey.version, Height: node.subtreeHeight,
++	}
++}
++
++func readExportPart(ctx context.Context, tree *ImmutableTree, part *exportPart) {
++	defer close(part.results)
++	traversal := part.root.newTraversal(tree, nil, nil, true, false, true)
++	for {
++		node, err := traversal.next()
++		if node == nil && err == nil {
++			return
++		}
++		result := exportResult{err: err}
++		if node != nil && err == nil {
++			result.node = nodeForExport(node)
++		}
++		select {
++		case part.results <- result:
++		case <-ctx.Done():
++			return
++		}
++		if err != nil {
++			return
++		}
++	}
++}
++
++func (e *Exporter) exportParallel(parent context.Context, workers int) error {
++	ctx, cancel := context.WithCancel(parent)
++	jobs := make(chan *exportPart, workers)
++	var wait sync.WaitGroup
++	defer func() {
++		cancel()
++		wait.Wait()
++	}()
++	for i := 0; i < workers; i++ {
++		wait.Add(1)
++		go func() {
++			defer wait.Done()
++			options := e.tree.ndb.opts
++			options.AsyncPruning = false
++			reader := &ImmutableTree{
++				ndb: newNodeDB(e.tree.ndb.db, 1024, options, e.tree.logger),
++				version: e.tree.version, skipFastStorageUpgrade: true,
++			}
++			defer reader.ndb.cancel()
++			for {
++				select {
++				case part := <-jobs:
++					readExportPart(ctx, reader, part)
++				case <-ctx.Done():
++					return
++				}
++			}
++		}()
++	}
++	cursor := exportCursor{tree: e.tree, stack: []exportFrame{{node: e.tree.root}}}
++	queue := make([]*exportPart, 0, workers*2)
++	pending := 0
++	finished := false
++	for {
++		for pending < workers && !finished {
++			part, err := cursor.next()
++			if err != nil {
++				return err
++			}
++			if part == nil {
++				finished = true
++				break
++			}
++			queue = append(queue, part)
++			if !part.direct {
++				select {
++				case jobs <- part:
++					pending++
++				case <-ctx.Done():
++					return ctx.Err()
++				}
++			}
++		}
++		if len(queue) == 0 {
++			return nil
++		}
++		part := queue[0]
++		queue[0] = nil
++		queue = queue[1:]
++		if part.direct {
++			select {
++			case e.ch <- nodeForExport(part.root):
++			case <-ctx.Done():
++				return ctx.Err()
++			}
++			continue
++		}
++		for result := range part.results {
++			if result.err != nil {
++				return result.err
++			}
++			select {
++			case e.ch <- result.node:
++			case <-ctx.Done():
++				return ctx.Err()
++			}
++		}
++		pending--
++	}
++}

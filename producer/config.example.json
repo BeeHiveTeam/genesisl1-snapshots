@@ -1,0 +1,15 @@
+{
+  "replica_rpc": "http://127.0.0.1:26657",
+  "replica_node_id": "REPLACE_WITH_THE_40_CHARACTER_NONVALIDATOR_NODE_ID",
+  "node_home": "/var/lib/genesisl1-replica/node",
+  "work_directory": "/var/lib/genesisl1-replica/native-work",
+  "output_directory": "/srv/genesisl1-native",
+  "exporter": "/opt/genesisl1-snapshots/bin/native-export",
+  "exporter_sha256": "REPLACE_WITH_THE_SHA256_PRINTED_BY_BUILD_EXPORTER",
+  "operator": "Your validator or team name",
+  "public_base_url": "https://snapshots.example.org/native",
+  "disk_reserve_gib": 150,
+  "cache_mib": 8192,
+  "export_workers": 16,
+  "open_files": 180000
+}

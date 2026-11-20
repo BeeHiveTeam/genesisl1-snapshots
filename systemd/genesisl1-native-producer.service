@@ -1,0 +1,29 @@
+[Unit]
+Description=Create and publish GenesisL1 Native snapshots from a dedicated replica
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=genesis-replica
+Group=genesis-replica
+ExecStart=/opt/genesisl1-snapshots/producer/create-native.sh run --config /etc/genesisl1-native-producer.json
+TimeoutStartSec=96h
+TimeoutStopSec=45s
+LimitNOFILE=524288
+Nice=15
+CPUWeight=10
+CPUQuota=400%
+IOWeight=10
+IOSchedulingClass=idle
+MemoryHigh=28G
+MemoryMax=32G
+Environment=GOMAXPROCS=4 GOMEMLIMIT=24GiB
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+UMask=0027
